@@ -92,11 +92,11 @@ set ( RUNTIME_VERSION_MAJOR ${VERSION_MAJOR} )
 set ( RUNTIME_VERSION_MINOR ${VERSION_MINOR} )
 set ( RUNTIME_VERSION_PATCH ${VERSION_PATCH} )
 
+include_directories ( ${HSAKMT_BUILD_INC_PATH})
 include_directories ( ${CMAKE_CURRENT_SOURCE_DIR} )
 include_directories ( ${CMAKE_CURRENT_SOURCE_DIR}/inc )
 include_directories ( ${CMAKE_CURRENT_SOURCE_DIR}/core/inc )
 include_directories ( ${CMAKE_CURRENT_SOURCE_DIR}/libamdhsacode )
-include_directories ( ${HSAKMT_BUILD_INC_PATH})
 
 link_directories ( ${HSAKMT_BUILD_LIB_PATH} )
 
@@ -114,7 +114,7 @@ else ( NOT DEFINED BUILDID )
 endif ()
 
 ## ------------------------- Linux Compiler and Linker options -------------------------
-set ( CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Werror -fexceptions -fno-rtti -fvisibility=hidden -Wno-error=sign-compare -Wno-sign-compare -Wno-write-strings -Wno-conversion-null -fno-math-errno -fno-threadsafe-statics -fmerge-all-constants -fms-extensions -Wno-error=comment -Wno-comment -Wno-error=pointer-arith -Wno-pointer-arith -Wno-error=unused-variable -Wno-error=unused-but-set-variable -Wno-error=unused-function" )
+set ( CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fexceptions -fno-rtti -fvisibility=hidden -Wno-error=sign-compare -Wno-sign-compare -Wno-write-strings -Wno-conversion-null -fno-math-errno -fno-threadsafe-statics -fmerge-all-constants -fms-extensions -Wno-error=comment -Wno-comment -Wno-error=pointer-arith -Wno-pointer-arith -Wno-error=unused-variable -Wno-error=unused-but-set-variable -Wno-error=unused-function" )
 
 set ( DRVDEF "${CMAKE_CURRENT_SOURCE_DIR}/hsacore.so.def" )
 
@@ -127,7 +127,7 @@ set ( CMAKE_SKIP_BUILD_RPATH TRUE )
 ##  -------------------------  End Compiler and Linker options ----------------------------
 
 ## Source files.
-set ( SRCS "core/util/lnx/os_linux.cpp"
+set ( SRCS "core/util/bsd/os_bsd.cpp"
             "core/util/small_heap.cpp"
             "core/util/timer.cpp"
             "core/runtime/amd_blit_kernel.cpp"
@@ -173,7 +173,7 @@ set_property ( TARGET ${CORE_RUNTIME_TARGET} PROPERTY SOVERSION "${RUNTIME_VERSI
 
 target_link_libraries ( ${CORE_RUNTIME_TARGET}
   PRIVATE hsakmt
-  elf dl pthread rt
+  elf c pthread rt
 )
 
 ## If the build is Release, strip the target library

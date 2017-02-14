@@ -59,7 +59,7 @@ class Checked {
   Checked(const Checked&) { object_ = uintptr_t(this) ^ uintptr_t(code); }
   Checked(Checked&&) { object_ = uintptr_t(this) ^ uintptr_t(code); }
 
-  virtual ~Checked() { object_ = NULL; }
+  virtual ~Checked() { object_ = (uintptr_t) NULL; }
 
   const Checked& operator=(Checked&& rhs) { return *this; }
   const Checked& operator=(const Checked& rhs) { return *this; }

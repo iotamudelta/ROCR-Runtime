@@ -50,6 +50,10 @@
 #include <unistd.h>
 #endif
 
+#ifdef __FreeBSD__
+#include <sys/thr.h>
+#endif
+
 #ifdef _WIN32
 #include <Windows.h>
 #endif
@@ -485,7 +489,13 @@ void AqlQueue::AllocRegisteredRingBuffer(uint32_t queue_size_pkts) {
 #ifdef __linux__
     // Create a system-unique shared memory path for this thread.
     char ring_buf_shm_path[16];
+#ifdef __FreeBSD__
+    long myID;
+    thr_self(&myID);
+    pid_t sys_unique_tid = pid_t(thr_self);
+#else
     pid_t sys_unique_tid = pid_t(syscall(__NR_gettid));
+#endif
     sprintf(ring_buf_shm_path, "/%u", sys_unique_tid);
 
     int ring_buf_shm_fd = -1;

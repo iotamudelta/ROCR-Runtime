@@ -65,7 +65,13 @@
 #define _lseek lseek
 #define _ftruncate ftruncate
 #define _tempnam tempnam
+#ifdef __FreeBSD__
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/uio.h>
+#else
 #include <sys/sendfile.h>
+#endif
 #include <fcntl.h>
 #include <unistd.h>
 #else
@@ -198,7 +204,11 @@ namespace amd {
       if (_lseek(d, 0L, SEEK_SET) < 0) { return perror("lseek(3) failed"); }
       ssize_t written;
       do {
+#ifdef __FreeBSD__
+        int err = sendfile(in, d, size, 0, NULL, &written, SF_SYNC);
+#else
         written = sendfile(d, in, NULL, size);
+#endif
         if (written < 0) {
           _close(in);
           return perror("sendfile failed");

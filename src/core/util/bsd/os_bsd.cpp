@@ -65,6 +65,7 @@ static_assert(sizeof(Thread) == sizeof(pthread_t),
 
 LibHandle LoadLib(std::string filename) {
   void* ret = dlopen(filename.c_str(), RTLD_LAZY);
+  if (ret == nullptr) debug_print("LoadLib(%s) failed: %s\n", filename.c_str(), dlerror());
   return *(LibHandle*)&ret;
 }
 
@@ -115,6 +116,8 @@ void DestroyMutex(Mutex lock) {
 }
 
 void Sleep(int delay_in_millisec) { usleep(delay_in_millisec * 1000); }
+
+void uSleep(int delayInUs) { usleep(delayInUs); }
 
 void YieldThread() { sched_yield(); }
 

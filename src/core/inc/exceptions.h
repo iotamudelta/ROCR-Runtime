@@ -40,48 +40,58 @@
 //
 ////////////////////////////////////////////////////////////////////////////////
 
-#ifndef AMD_HSA_QUEUE_H
-#define AMD_HSA_QUEUE_H
+#ifndef HSA_RUNTIME_CORE_INC_EXCEPTIONS_H
+#define HSA_RUNTIME_CORE_INC_EXCEPTIONS_H
 
-#include "amd_hsa_common.h"
-#include "hsa.h"
+#include <exception>
+#include <string>
 
-// AMD Queue Properties.
-typedef uint32_t amd_queue_properties32_t;
-enum amd_queue_properties_t {
-  AMD_HSA_BITS_CREATE_ENUM_ENTRIES(AMD_QUEUE_PROPERTIES_ENABLE_TRAP_HANDLER, 0, 1),
-  AMD_HSA_BITS_CREATE_ENUM_ENTRIES(AMD_QUEUE_PROPERTIES_IS_PTR64, 1, 1),
-  AMD_HSA_BITS_CREATE_ENUM_ENTRIES(AMD_QUEUE_PROPERTIES_ENABLE_TRAP_HANDLER_DEBUG_SGPRS, 2, 1),
-  AMD_HSA_BITS_CREATE_ENUM_ENTRIES(AMD_QUEUE_PROPERTIES_ENABLE_PROFILING, 3, 1),
-  AMD_HSA_BITS_CREATE_ENUM_ENTRIES(AMD_QUEUE_PROPERTIES_USE_SCRATCH_ONCE, 4, 1),
-  AMD_HSA_BITS_CREATE_ENUM_ENTRIES(AMD_QUEUE_PROPERTIES_RESERVED1, 5, 27)
+#include "core/inc/hsa_internal.h"
+
+namespace AMD {
+
+/// @brief Exception type which carries an error code to return to the user.
+class hsa_exception : public std::exception {
+ public:
+  hsa_exception(hsa_status_t error, const char* description) : err_(error), desc_(description) {}
+  hsa_status_t error_code() const noexcept { return err_; }
+  const char* what() const noexcept override { return desc_.c_str(); }
+
+ private:
+  hsa_status_t err_;
+  std::string desc_;
 };
 
-// AMD Queue.
-#define AMD_QUEUE_ALIGN_BYTES 64
-#define AMD_QUEUE_ALIGN __ALIGNED__(AMD_QUEUE_ALIGN_BYTES)
-typedef struct AMD_QUEUE_ALIGN amd_queue_s {
-  hsa_queue_t hsa_queue;
-  uint32_t reserved1[4];
-  volatile uint64_t write_dispatch_id;
-  uint32_t group_segment_aperture_base_hi;
-  uint32_t private_segment_aperture_base_hi;
-  uint32_t max_cu_id;
-  uint32_t max_wave_id;
-  volatile uint64_t max_legacy_doorbell_dispatch_id_plus_1;
-  volatile uint32_t legacy_doorbell_lock;
-  uint32_t reserved2[9];
-  volatile uint64_t read_dispatch_id;
-  uint32_t read_dispatch_id_field_base_byte_offset;
-  uint32_t compute_tmpring_size;
-  uint32_t scratch_resource_descriptor[4];
-  uint64_t scratch_backing_memory_location;
-  uint64_t scratch_backing_memory_byte_size;
-  uint32_t scratch_workitem_byte_size;
-  amd_queue_properties32_t queue_properties;
-  uint32_t reserved3[2];
-  hsa_signal_t queue_inactive_signal;
-  uint32_t reserved4[14];
-} amd_queue_t;
+/// @brief Holds and invokes callbacks, capturing any execptions and forwarding those to the user
+/// after unwinding the runtime stack.
+template <class F> class callback_t;
+template <class R, class... Args> class callback_t<R (*)(Args...)> {
+ public:
+  typedef R (*func_t)(Args...);
 
-#endif // AMD_HSA_QUEUE_H
+  callback_t() : function(nullptr) {}
+
+  // Should not be marked explicit.
+  callback_t(func_t function_ptr) : function(function_ptr) {}
+  callback_t& operator=(func_t function_ptr) { function = function_ptr; return *this; }
+
+  // Allows common function pointer idioms, such as if( func != nullptr )...
+  // without allowing silent reversion to the original function pointer type.
+  operator void*() { return reinterpret_cast<void*>(function); }
+
+  R operator()(Args... args) {
+    try {
+      return function(args...);
+    } catch (...) {
+      throw std::nested_exception();
+      return R();
+    }
+  }
+
+ private:
+  func_t function;
+};
+
+}  // namespace AMD
+
+#endif  // HSA_RUNTIME_CORE_INC_EXCEPTIONS_H

@@ -87,16 +87,16 @@ namespace loader {
     gfx803.handle = 803;
     gfx804.handle = 804;
     gfx810.handle = 810;
-#if defined(GFX9_BUILD)
     gfx900.handle = 900;
     gfx901.handle = 901;
-#endif // GFX9_BUILD
+    gfx902.handle = 902;
+    gfx903.handle = 903;
   }
 
   hsa_isa_t OfflineLoaderContext::IsaFromName(const char *name)
   {
     std::string sname(name);
-           if (sname == "AMD:AMDGPU:7:0:0") {
+    if (sname == "AMD:AMDGPU:7:0:0") {
       return gfx700;
     } else if (sname == "AMD:AMDGPU:7:0:1") {
       return gfx701;
@@ -112,16 +112,18 @@ namespace loader {
       return gfx804;
     } else if (sname == "AMD:AMDGPU:8:1:0") {
       return gfx810;
-#if defined(GFX9_BUILD)
     } else if (sname == "AMD:AMDGPU:9:0:0") {
       return gfx900;
     } else if (sname == "AMD:AMDGPU:9:0:1") {
       return gfx901;
-#endif // GFX_BUILD
-    } else {
-      assert(0);
-      return invalid;
+    } else if (sname == "AMD:AMDGPU:9:0:2") {
+      return gfx902;
+    } else if (sname == "AMD:AMDGPU:9:0:3") {
+      return gfx903;
     }
+
+    assert(0);
+    return invalid;
   }
 
   bool OfflineLoaderContext::IsaSupportedByAgent(hsa_agent_t agent, hsa_isa_t isa)

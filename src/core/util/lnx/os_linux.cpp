@@ -47,11 +47,14 @@
 #include <dlfcn.h>
 #include <pthread.h>
 #include <sched.h>
-#include <string>
-#include <cstring>
 #include <sys/sysinfo.h>
 #include <sys/time.h>
+#include <sys/utsname.h>
 #include <unistd.h>
+#include <errno.h>
+#include <cstring>
+#include <string>
+#include <atomic>
 
 namespace os {
 
@@ -64,6 +67,7 @@ static_assert(sizeof(Thread) == sizeof(pthread_t),
 
 LibHandle LoadLib(std::string filename) {
   void* ret = dlopen(filename.c_str(), RTLD_LAZY);
+  if (ret == nullptr) debug_print("LoadLib(%s) failed: %s\n", filename.c_str(), dlerror());
   return *(LibHandle*)&ret;
 }
 
@@ -114,6 +118,8 @@ void DestroyMutex(Mutex lock) {
 }
 
 void Sleep(int delay_in_millisec) { usleep(delay_in_millisec * 1000); }
+
+void uSleep(int delayInUs) { usleep(delayInUs); }
 
 void YieldThread() { sched_yield(); }
 
@@ -320,24 +326,50 @@ int ResetOsEvent(EventHandle event) {
   return ret_code;
 }
 
+static double invPeriod = 0.0;
+
 uint64_t ReadAccurateClock() {
+  if (invPeriod == 0.0) AccurateClockFrequency();
   timespec time;
   int err = clock_gettime(CLOCK_MONOTONIC_RAW, &time);
   assert(err == 0 && "clock_gettime(CLOCK_MONOTONIC_RAW,...) failed");
-  return uint64_t(time.tv_sec) * 1000000000ull + uint64_t(time.tv_nsec);
+  return (uint64_t(time.tv_sec) * 1000000000ull + uint64_t(time.tv_nsec)) * invPeriod;
 }
 
 uint64_t AccurateClockFrequency() {
+  static clockid_t clock = CLOCK_MONOTONIC;
+  static std::atomic<bool> first(true);
+  // Check kernel version - not a concurrency concern.
+  // use non-RAW for getres due to bug in older 2.6.x kernels
+  if (first.load(std::memory_order_acquire)) {
+    utsname kernelInfo;
+    if (uname(&kernelInfo) == 0) {
+      try {
+        std::string ver = kernelInfo.release;
+        size_t idx;
+        int major = std::stoi(ver, &idx);
+        int minor = std::stoi(ver.substr(idx + 1));
+        if ((major >= 4) && (minor >= 4)) {
+          clock = CLOCK_MONOTONIC_RAW;
+        }
+      } catch (...) {
+        // Kernel version string doesn't conform to the standard pattern.
+        // Keep using the "safe" (non-RAW) clock.
+      }
+    }
+    first.store(false, std::memory_order_release);
+  }
   timespec time;
-  int err = clock_getres(CLOCK_MONOTONIC_RAW, &time);
-  assert(err == 0 && "clock_getres(CLOCK_MONOTONIC_RAW,...) failed");
+  int err = clock_getres(clock, &time);
+  assert(err == 0 && "clock_getres(CLOCK_MONOTONIC(_RAW),...) failed");
   assert(time.tv_sec == 0 &&
-         "clock_getres(CLOCK_MONOTONIC_RAW,...) returned very low frequency "
+         "clock_getres(CLOCK_MONOTONIC(_RAW),...) returned very low frequency "
          "(<1Hz).");
   assert(time.tv_nsec < 0xFFFFFFFF &&
-         "clock_getres(CLOCK_MONOTONIC_RAW,...) returned very low frequency "
+         "clock_getres(CLOCK_MONOTONIC(_RAW),...) returned very low frequency "
          "(<1Hz).");
-  return uint64_t(time.tv_nsec) * 1000000000ull;
+  if (invPeriod == 0.0) invPeriod = 1.0 / double(time.tv_nsec);
+  return 1000000000ull / uint64_t(time.tv_nsec);
 }
 }
 

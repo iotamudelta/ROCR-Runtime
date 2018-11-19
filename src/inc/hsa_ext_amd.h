@@ -100,7 +100,7 @@ typedef enum hsa_amd_agent_info_s {
   HSA_AMD_AGENT_INFO_MAX_ADDRESS_WATCH_POINTS = 0xA005,
   /**
    * Agent BDF_ID, named LocationID in thunk. The type of this attribute is
-   * uint16_t.
+   * uint32_t.
    */
   HSA_AMD_AGENT_INFO_BDFID = 0xA006,
   /**
@@ -121,7 +121,22 @@ typedef enum hsa_amd_agent_info_s {
    * Maximum number of waves possible in a Compute Unit.
    * The type of this attribute is uint32_t.
    */
-  HSA_AMD_AGENT_INFO_MAX_WAVES_PER_CU = 0xA00A
+  HSA_AMD_AGENT_INFO_MAX_WAVES_PER_CU = 0xA00A,
+  /**
+   * Number of SIMD's per compute unit CU
+   * The type of this attribute is uint32_t.
+   */
+  HSA_AMD_AGENT_INFO_NUM_SIMDS_PER_CU = 0xA00B,
+  /**
+   * Number of Shader Engines (SE) in Gpu
+   * The type of this attribute is uint32_t.
+   */
+  HSA_AMD_AGENT_INFO_NUM_SHADER_ENGINES = 0xA00C,
+  /**
+   * Number of Shader Arrays Per Shader Engines in Gpu
+   * The type of this attribute is uint32_t.
+   */
+  HSA_AMD_AGENT_INFO_NUM_SHADER_ARRAYS_PER_SE = 0xA00D
 } hsa_amd_agent_info_t;
 
 /**
@@ -284,9 +299,8 @@ hsa_status_t HSA_API
  * @brief Retrieve packet processing time stamps.
  *
  * @param[in] agent The agent with which the signal was last used.  For
- *instance,
- * if the profiled dispatch packet is dispatched on to queue Q, which was
- * created on agent A, then this parameter must be A.
+ * instance, if the profiled dispatch packet is dispatched onto queue Q,
+ * which was created on agent A, then this parameter must be A.
  *
  * @param[in] signal A signal used as the completion signal of the dispatch
  * packet to retrieve time stamps from.  This dispatch packet must have been
@@ -361,6 +375,64 @@ hsa_status_t HSA_API
     hsa_amd_profiling_convert_tick_to_system_domain(hsa_agent_t agent,
                                                     uint64_t agent_tick,
                                                     uint64_t* system_tick);
+
+/**
+ * @brief Signal attribute flags.
+ */
+typedef enum {
+  /**
+   * Signal will only be consumed by AMD GPUs.  Limits signal consumption to
+   * AMD GPU agents only.  Ignored if @p num_consumers is not zero (all agents).
+   */
+  HSA_AMD_SIGNAL_AMD_GPU_ONLY = 1,
+  /**
+   * Signal may be used for interprocess communication.
+   * IPC signals can be read, written, and waited on from any process.
+   * Profiling using an IPC enabled signal is only supported in a single process
+   * at a time.  Producing profiling data in one process and consuming it in
+   * another process is undefined.
+   */
+  HSA_AMD_SIGNAL_IPC = 2,
+} hsa_amd_signal_attribute_t;
+
+/**
+ * @brief Create a signal with specific attributes.
+ *
+ * @param[in] initial_value Initial value of the signal.
+ *
+ * @param[in] num_consumers Size of @p consumers. A value of 0 indicates that
+ * any agent might wait on the signal.
+ *
+ * @param[in] consumers List of agents that might consume (wait on) the
+ * signal. If @p num_consumers is 0, this argument is ignored; otherwise, the
+ * HSA runtime might use the list to optimize the handling of the signal
+ * object. If an agent not listed in @p consumers waits on the returned
+ * signal, the behavior is undefined. The memory associated with @p consumers
+ * can be reused or freed after the function returns.
+ *
+ * @param[in] attributes Requested signal attributes.  Multiple signal attributes
+ * may be requested by combining them with bitwise OR.  Requesting no attributes
+ * (@p attributes == 0) results in the same signal as would have been obtained
+ * via hsa_signal_create.
+ *
+ * @param[out] signal Pointer to a memory location where the HSA runtime will
+ * store the newly created signal handle. Must not be NULL.
+ *
+ * @retval ::HSA_STATUS_SUCCESS The function has been executed successfully.
+ *
+ * @retval ::HSA_STATUS_ERROR_NOT_INITIALIZED The HSA runtime has not been
+ * initialized.
+ *
+ * @retval ::HSA_STATUS_ERROR_OUT_OF_RESOURCES The HSA runtime failed to allocate
+ * the required resources.
+ *
+ * @retval ::HSA_STATUS_ERROR_INVALID_ARGUMENT @p signal is NULL, @p
+ * num_consumers is greater than 0 but @p consumers is NULL, or @p consumers
+ * contains duplicates.
+ */
+hsa_status_t HSA_API hsa_amd_signal_create(hsa_signal_value_t initial_value, uint32_t num_consumers,
+                                           const hsa_agent_t* consumers, uint64_t attributes,
+                                           hsa_signal_t* signal);
 
 /**
  * @brief Asyncronous signal handler function type.
@@ -640,17 +712,17 @@ typedef enum {
 
 /**
  * @brief Get the current value of an attribute of a memory pool.
- * 
+ *
  * @param[in] memory_pool A valid memory pool.
- * 
+ *
  * @param[in] attribute Attribute to query.
- * 
+ *
  * @param[out] value Pointer to a application-allocated buffer where to store
  * the value of the attribute. If the buffer passed by the application is not
  * large enough to hold the value of @p attribute, the behavior is undefined.
- * 
+ *
  * @retval ::HSA_STATUS_SUCCESS The function has been executed successfully.
- * 
+ *
  */
 hsa_status_t HSA_API
     hsa_amd_memory_pool_get_info(hsa_amd_memory_pool_t memory_pool,
@@ -670,7 +742,7 @@ hsa_status_t HSA_API
  *
  * @param[in] agent A valid agent.
  *
- * @param[in] callback Callback to be invoked on the same thread that called 
+ * @param[in] callback Callback to be invoked on the same thread that called
  * ::hsa_amd_agent_iterate_memory_pools, serially, once per memory pool that is
  * associated with the agent.  The HSA runtime passes two arguments to the
  * callback: the memory pool, and the application data.  If @p callback
@@ -902,6 +974,10 @@ typedef struct hsa_amd_memory_pool_link_info_s {
   */
   hsa_amd_link_info_type_t link_type;
 
+  /**
+   * NUMA distance of memory pool relative to querying agent
+   */
+  uint32_t numa_distance;
 } hsa_amd_memory_pool_link_info_t;
 
 /**
@@ -1149,13 +1225,16 @@ hsa_status_t HSA_API hsa_amd_memory_unlock(void* host_ptr);
  *
  * @param[in] count Number of uint32_t element to be set to the value.
  *
- * @retval ::HSA_STATUS_SUCCESS The function has been executed successfully.
+ * @retval HSA_STATUS_SUCCESS The function has been executed successfully.
  *
- * @retval ::HSA_STATUS_ERROR_NOT_INITIALIZED The HSA runtime has not been
+ * @retval HSA_STATUS_ERROR_NOT_INITIALIZED The HSA runtime has not been
  * initialized.
  *
- * @retval ::HSA_STATUS_ERROR_INVALID_ARGUMENT @p ptr is NULL or
+ * @retval HSA_STATUS_ERROR_INVALID_ARGUMENT @p ptr is NULL or
  * not 4 bytes aligned
+ *
+ * @retval HSA_STATUS_ERROR_INVALID_ALLOCATION if the given memory
+ * region was not allocated with HSA runtime APIs.
  *
  */
 hsa_status_t HSA_API
@@ -1187,7 +1266,7 @@ hsa_status_t HSA_API
  * @param[out] metadata_size Size of metadata in bytes, may be NULL
  *
  * @param[out] metadata Pointer to metadata, may be NULL
- * 
+ *
  * @retval HSA_STATUS_SUCCESS if successfully mapped
  *
  * @retval HSA_STATUS_ERROR_NOT_INITIALIZED if HSA is not initialized
@@ -1197,13 +1276,13 @@ hsa_status_t HSA_API
  *
  * @retval HSA_STATUS_ERROR_INVALID_ARGUMENT all other errors
  */
-hsa_status_t HSA_API hsa_amd_interop_map_buffer(uint32_t num_agents,   
-                                        hsa_agent_t* agents,       
-                                        int interop_handle,    
-                                        uint32_t flags,        
-                                        size_t* size,          
-                                        void** ptr,            
-                                        size_t* metadata_size, 
+hsa_status_t HSA_API hsa_amd_interop_map_buffer(uint32_t num_agents,
+                                        hsa_agent_t* agents,
+                                        int interop_handle,
+                                        uint32_t flags,
+                                        size_t* size,
+                                        void** ptr,
+                                        size_t* metadata_size,
                                         const void** metadata);
 
 /**
@@ -1222,7 +1301,7 @@ typedef struct hsa_amd_image_descriptor_s {
   Version number of the descriptor
   */
   uint32_t version;
-  
+
   /*
   Vendor and device PCI IDs for the format as VENDOR_ID<<16|DEVICE_ID.
   */
@@ -1302,7 +1381,7 @@ typedef enum {
  * @brief Describes a memory allocation known to ROCr.
  * Within a ROCr major version this structure can only grow.
  */
-typedef struct hsa_amd_pointer_info_v1_s {
+typedef struct hsa_amd_pointer_info_s {
   /*
   Size in bytes of this structure.  Used for version control within a major ROCr
   revision.  Set to sizeof(hsa_amd_pointer_t) prior to calling
@@ -1331,6 +1410,12 @@ typedef struct hsa_amd_pointer_info_v1_s {
   Application provided value.
   */
   void* userData;
+  /*
+  Reports an agent which "owns" (ie has preferred access to) the pool in which the allocation was
+  made.  When multiple agents share equal access to a pool (ex: multiple CPU agents, or multi-die
+  GPU boards) any such agent may be returned.
+  */
+  hsa_agent_t agentOwner;
 } hsa_amd_pointer_info_t;
 
 /**
@@ -1408,7 +1493,7 @@ typedef struct hsa_amd_ipc_memory_s {
  * any process.  In general applications should confirm that a shared memory
  * region has been attached (via hsa_amd_ipc_memory_attach) in the remote
  * process prior to releasing that memory in the local process.
- * Repeated calls for the same allocaiton may, but are not required to, return
+ * Repeated calls for the same allocation may, but are not required to, return
  * unique handles.
  *
  * @param[in] ptr Pointer to memory allocated via ROCr APIs to prepare for
@@ -1486,6 +1571,168 @@ hsa_status_t HSA_API hsa_amd_ipc_memory_attach(
  * with hsa_amd_ipc_memory_attach.
  */
 hsa_status_t HSA_API hsa_amd_ipc_memory_detach(void* mapped_ptr);
+
+/**
+ * @brief 256-bit process independent identifier for a ROCr IPC signal.
+ */
+typedef hsa_amd_ipc_memory_t hsa_amd_ipc_signal_t;
+
+/**
+ * @brief Obtains an interprocess sharing handle for a signal.  The handle is
+ * valid while the signal it references remains valid in any process.  In
+ * general applications should confirm that the signal has been attached (via
+ * hsa_amd_ipc_signal_attach) in the remote process prior to destroying that
+ * signal in the local process.
+ * Repeated calls for the same signal may, but are not required to, return
+ * unique handles.
+ *
+ * @param[in] signal Signal created with attribute HSA_AMD_SIGNAL_IPC.
+ *
+ * @param[out] handle Process independent identifier referencing the shared
+ * signal.
+ *
+ * @retval HSA_STATUS_SUCCESS @p handle is ready to use for interprocess sharing.
+ *
+ * @retval HSA_STATUS_ERROR_NOT_INITIALIZED if HSA is not initialized
+ *
+ * @retval HSA_STATUS_ERROR_OUT_OF_RESOURCES if there is a failure in allocating
+ * necessary resources
+ *
+ * @retval HSA_STATUS_ERROR_INVALID_ARGUMENT @p signal is not a valid signal
+ * created with attribute HSA_AMD_SIGNAL_IPC or handle is NULL.
+ */
+hsa_status_t HSA_API hsa_amd_ipc_signal_create(hsa_signal_t signal, hsa_amd_ipc_signal_t* handle);
+
+/**
+ * @brief Imports an IPC capable signal into the local process.  If an IPC
+ * signal handle is attached multiple times in a process each attach may return
+ * a different signal handle.  Each returned signal handle is refcounted and
+ * requires a matching number of calls to hsa_signal_destroy to release the
+ * shared signal.
+ *
+ * @param[in] handle Pointer to the identifier for the shared signal.
+ *
+ * @param[out] signal Recieves a process local signal handle to the shared signal.
+ *
+ * @retval HSA_STATUS_SUCCESS if the signal is successfully imported.
+ *
+ * @retval HSA_STATUS_ERROR_NOT_INITIALIZED if HSA is not initialized
+ *
+ * @retval HSA_STATUS_ERROR_OUT_OF_RESOURCES if there is a failure in allocating
+ * necessary resources
+ *
+ * @retval HSA_STATUS_ERROR_INVALID_ARGUMENT @p handle is not valid.
+ */
+hsa_status_t HSA_API hsa_amd_ipc_signal_attach(const hsa_amd_ipc_signal_t* handle,
+                                               hsa_signal_t* signal);
+
+/**
+ * @brief GPU system event type.
+ */
+typedef enum hsa_amd_event_type_s {
+  /*
+   AMD GPU memory fault.
+   */
+  GPU_MEMORY_FAULT_EVENT = 0,
+} hsa_amd_event_type_t;
+
+/**
+ * @brief AMD GPU memory fault event data.
+ */
+typedef struct hsa_amd_gpu_memory_fault_info_s {
+  /*
+  The agent where the memory fault occurred.
+  */
+  hsa_agent_t agent;
+  /*
+  Virtual address accessed.
+  */
+  uint64_t virtual_address;
+  /*
+  Bit field encoding the memory access failure reasons. There could be multiple bits set
+  for one fault.
+  0x00000001 Page not present or supervisor privilege.
+  0x00000010 Write access to a read-only page.
+  0x00000100 Execute access to a page marked NX.
+  0x00001000 Host access only.
+  0x00010000 ECC failure (if supported by HW).
+  0x00100000 Can't determine the exact fault address.
+  */
+  uint32_t fault_reason_mask;
+} hsa_amd_gpu_memory_fault_info_t;
+
+/**
+ * @brief AMD GPU event data passed to event handler.
+ */
+typedef struct hsa_amd_event_s {
+  /*
+  The event type.
+  */
+  hsa_amd_event_type_t event_type;
+  union {
+    /*
+    The memory fault info, only valid when @p event_type is GPU_MEMORY_FAULT_EVENT.
+    */
+    hsa_amd_gpu_memory_fault_info_t memory_fault;
+  };
+} hsa_amd_event_t;
+
+typedef hsa_status_t (*hsa_amd_system_event_callback_t)(const hsa_amd_event_t* event, void* data);
+
+/**
+ * @brief Register AMD GPU event handler.
+ *
+ * @param[in] callback Callback to be invoked when an event is triggered.
+ * The HSA runtime passes two arguments to the callback: @p event
+ * is defined per event by the HSA runtime, and @p data is the user data.
+ *
+ * @param[in] data User data that is passed to @p callback. May be NULL.
+ *
+ * @retval HSA_STATUS_SUCCESS The handler has been registered successfully.
+ *
+ * @retval HSA_STATUS_ERROR An event handler has already been registered.
+ *
+ * @retval HSA_STATUS_ERROR_INVALID_ARGUMENT @p event is invalid.
+ */
+hsa_status_t hsa_amd_register_system_event_handler(hsa_amd_system_event_callback_t callback,
+                                                   void* data);
+
+/**
+ * @brief Per-queue dispatch and wavefront scheduling priority.
+ */
+typedef enum hsa_amd_queue_priority_s {
+  /*
+  Below normal/high priority compute and all graphics
+  */
+  HSA_AMD_QUEUE_PRIORITY_LOW = 0,
+  /*
+  Above low priority compute, below high priority compute and all graphics
+  */
+  HSA_AMD_QUEUE_PRIORITY_NORMAL = 1,
+  /*
+  Above low/normal priority compute and all graphics
+  */
+  HSA_AMD_QUEUE_PRIORITY_HIGH = 2,
+} hsa_amd_queue_priority_t;
+
+/**
+ * @brief Modifies the dispatch and wavefront scheduling prioirty for a
+ * given compute queue. The default is HSA_AMD_QUEUE_PRIORITY_NORMAL.
+ *
+ * @param[in] queue Compute queue to apply new priority to.
+ *
+ * @param[in] priority Priority to associate with queue.
+ *
+ * @retval HSA_STATUS_SUCCESS if priority was changed successfully.
+ *
+ * @retval HSA_STATUS_ERROR_INVALID_QUEUE if queue is not a valid
+ * compute queue handle.
+ *
+ * @retval HSA_STATUS_ERROR_INVALID_ARGUMENT if priority is not a valid
+ * value from hsa_amd_queue_priority_t.
+ */
+hsa_status_t HSA_API hsa_amd_queue_set_priority(hsa_queue_t* queue,
+                                                hsa_amd_queue_priority_t priority);
 
 #ifdef __cplusplus
 }  // end extern "C" block

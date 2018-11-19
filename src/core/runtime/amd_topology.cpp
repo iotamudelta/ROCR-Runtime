@@ -97,6 +97,34 @@ void RegisterLinkInfo(uint32_t node_id, uint32_t num_link) {
     // Populate link info with thunk property.
     hsa_amd_memory_pool_link_info_t link_info = {0};
 
+    switch (io_link.IoLinkType) {
+      case HSA_IOLINKTYPE_HYPERTRANSPORT:
+        link_info.link_type = HSA_AMD_LINK_INFO_TYPE_HYPERTRANSPORT;
+        link_info.atomic_support_32bit = true;
+        link_info.atomic_support_64bit = true;
+        link_info.coherent_support = true;
+        break;
+      case HSA_IOLINKTYPE_PCIEXPRESS:
+        link_info.link_type = HSA_AMD_LINK_INFO_TYPE_PCIE;
+        link_info.atomic_support_32bit = true;
+        link_info.atomic_support_64bit = true;
+        link_info.coherent_support = true;
+        break;
+      case HSA_IOLINK_TYPE_QPI_1_1:
+        link_info.link_type = HSA_AMD_LINK_INFO_TYPE_QPI;
+        link_info.atomic_support_32bit = true;
+        link_info.atomic_support_64bit = true;
+        link_info.coherent_support = true;
+        break;
+      case HSA_IOLINK_TYPE_INFINIBAND:
+        link_info.link_type = HSA_AMD_LINK_INFO_TYPE_INFINBAND;
+        debug_print("IOLINK is missing atomic and coherency defaults.\n");
+        break;
+      default:
+        debug_print("Unrecognized IOLINK type.\n");
+        break;
+    }
+
     if (io_link.Flags.ui32.Override == 1) {
       if (io_link.Flags.ui32.NoPeerToPeerDMA == 1) {
         // Ignore this link since peer to peer is not allowed.
@@ -105,32 +133,13 @@ void RegisterLinkInfo(uint32_t node_id, uint32_t num_link) {
       link_info.atomic_support_32bit = (io_link.Flags.ui32.NoAtomics32bit == 0);
       link_info.atomic_support_64bit = (io_link.Flags.ui32.NoAtomics64bit == 0);
       link_info.coherent_support = (io_link.Flags.ui32.NonCoherent == 0);
-    } else {
-      // TODO: decipher HSA_IOLINKTYPE to fill out the atomic
-      // and coherent information.
-    }
-
-    switch (io_link.IoLinkType) {
-      case HSA_IOLINKTYPE_HYPERTRANSPORT:
-        link_info.link_type = HSA_AMD_LINK_INFO_TYPE_HYPERTRANSPORT;
-        break;
-      case HSA_IOLINKTYPE_PCIEXPRESS:
-        link_info.link_type = HSA_AMD_LINK_INFO_TYPE_PCIE;
-        break;
-      case HSA_IOLINK_TYPE_QPI_1_1:
-        link_info.link_type = HSA_AMD_LINK_INFO_TYPE_QPI;
-        break;
-      case HSA_IOLINK_TYPE_INFINIBAND:
-        link_info.link_type = HSA_AMD_LINK_INFO_TYPE_INFINBAND;
-        break;
-      default:
-        break;
     }
 
     link_info.max_bandwidth = io_link.MaximumBandwidth;
     link_info.max_latency = io_link.MaximumLatency;
     link_info.min_bandwidth = io_link.MinimumBandwidth;
     link_info.min_latency = io_link.MinimumLatency;
+    link_info.numa_distance = io_link.Weight;
 
     core::Runtime::runtime_singleton_->RegisterLinkInfo(
         io_link.NodeFrom, io_link.NodeTo, io_link.Weight, link_info);

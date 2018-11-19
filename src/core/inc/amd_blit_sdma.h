@@ -55,9 +55,22 @@
 #include "core/util/utils.h"
 
 namespace amd {
-class BlitSdma : public core::Blit {
+class BlitSdmaBase : public core::Blit {
  public:
-  explicit BlitSdma();
+  static const size_t kQueueSize;
+  static const size_t kCopyPacketSize;
+  static const size_t kMaxSingleCopySize;
+  static const size_t kMaxSingleFillSize;
+  virtual bool isSDMA() const override { return true; }
+};
+
+// RingIndexTy: 32/64-bit monotonic ring index, counting in bytes.
+// HwIndexMonotonic: true if SDMA HW index is monotonic, false if it wraps at end of ring.
+// SizeToCountOffset: value added to size (in bytes) to form SDMA command count field.
+template <typename RingIndexTy, bool HwIndexMonotonic, int SizeToCountOffset>
+class BlitSdma : public BlitSdmaBase {
+ public:
+  explicit BlitSdma(bool copy_direction);
 
   virtual ~BlitSdma() override;
 
@@ -113,11 +126,7 @@ class BlitSdma : public core::Blit {
 
   virtual hsa_status_t EnableProfiling(bool enable) override;
 
-  static const size_t kQueueSize;
-
-  static const size_t kCopyPacketSize;
-
- protected:
+ private:
   /// @brief Acquires the address into queue buffer where a new command
   /// packet of specified size could be written. The address that is
   /// returned is guaranteed to be unique even in a multi-threaded access
@@ -126,13 +135,15 @@ class BlitSdma : public core::Blit {
   ///
   /// @param cmd_size Command packet size in bytes.
   ///
+  /// @param curr_index (output) Index to pass to ReleaseWriteAddress.
+  ///
   /// @return pointer into the queue buffer where a PM4 packet of specified size
   /// could be written. NULL if input size is greater than the size of queue
   /// buffer.
-  char* AcquireWriteAddress(uint32_t cmd_size);
 
-  void UpdateWriteAndDoorbellRegister(uint32_t current_offset,
-                                      uint32_t new_offset);
+  char* AcquireWriteAddress(uint32_t cmd_size, RingIndexTy& curr_index);
+
+  void UpdateWriteAndDoorbellRegister(RingIndexTy curr_index, RingIndexTy new_index);
 
   /// @brief Updates the Write Register of compute device to the end of
   /// SDMA packet written into queue buffer. The update to Write Register
@@ -142,21 +153,26 @@ class BlitSdma : public core::Blit {
   /// will block until T1 has completed its update (assumes T1 acquired the
   /// write address first).
   ///
-  /// @param cmd_addr pointer into the queue buffer where a PM4 packet was
-  /// written.
+  /// @param curr_index Index passed back from AcquireWriteAddress.
   ///
   /// @param cmd_size Command packet size in bytes.
-  void ReleaseWriteAddress(char* cmd_addr, uint32_t cmd_size);
+  void ReleaseWriteAddress(RingIndexTy curr_index, uint32_t cmd_size);
 
   /// @brief Writes NO-OP words into queue buffer in case writing a command
   /// causes the queue buffer to wrap.
   ///
-  /// @param cmd_size Size in bytes of command causing queue buffer to wrap.
-  void WrapQueue(uint32_t cmd_size);
+  /// @param curr_index Index to begin padding from.
+  void PadRingToEnd(RingIndexTy curr_index);
+
+  uint32_t WrapIntoRing(RingIndexTy index);
+  bool CanWriteUpto(RingIndexTy upto_index);
 
   /// @brief Build fence command
   void BuildFenceCommand(char* fence_command_addr, uint32_t* fence,
                          uint32_t fence_value);
+
+  /// @brief Build Hdp Flush command
+  void BuildHdpFlushCommand(char* cmd_addr);
 
   uint32_t* ObtainFenceObject();
 
@@ -176,9 +192,6 @@ class BlitSdma : public core::Blit {
   // Agent object owning the SDMA engine.
   GpuAgent* agent_;
 
-  /// Indicates size of Queue buffer in bytes.
-  uint32_t queue_size_;
-
   /// Base address of the Queue buffer at construction time.
   char* queue_start_addr_;
 
@@ -191,34 +204,29 @@ class BlitSdma : public core::Blit {
   /// and write indices
   HsaQueueResource queue_resource_;
 
-  /// @brief Current address of execution in Queue buffer.
-  ///
-  /// @note: The value of address is obtained by reading
-  /// the value of Write Register of the compute device.
-  /// Users should write to the Queue buffer at the current
-  /// address, else it will lead to execution error and potentially
-  /// a hang.
-  ///
-  /// @note: The value of Write Register does not always begin
-  /// with Zero after a Queue has been created. This needs to be
-  /// understood better. This means that current address number of
-  /// words of Queue buffer is unavailable for use.
-  volatile uint32_t cached_reserve_offset_;
-  volatile uint32_t cached_commit_offset_;
+  // Monotonic ring indices, in bytes, tracking written and submitted commands.
+  RingIndexTy cached_reserve_index_;
+  RingIndexTy cached_commit_index_;
 
-  uint32_t linear_copy_command_size_;
+  static const uint32_t linear_copy_command_size_;
 
-  uint32_t fill_command_size_;
+  static const uint32_t fill_command_size_;
 
-  uint32_t fence_command_size_;
+  static const uint32_t fence_command_size_;
 
-  uint32_t poll_command_size_;
+  static const uint32_t poll_command_size_;
 
-  uint32_t atomic_command_size_;
+  static const uint32_t flush_command_size_;
 
-  uint32_t timestamp_command_size_;
+  static const uint32_t atomic_command_size_;
 
-  uint32_t trap_command_size_;
+  static const uint32_t timestamp_command_size_;
+
+  static const uint32_t trap_command_size_;
+
+  // Flag to indicate if sDMA queue is used for H2D copy operations
+  // true if used for H2D operations, false otherwise
+  const bool sdma_h2d_;
 
   // Max copy size of a single linear copy command packet.
   size_t max_single_linear_copy_size_;
@@ -234,7 +242,21 @@ class BlitSdma : public core::Blit {
 
   /// True if platform atomic is supported.
   bool platform_atomic_support_;
+
+  /// True if sDMA supports HDP flush
+  bool hdp_flush_support_;
 };
+
+// Ring indices are 32-bit.
+// HW ring indices are not monotonic (wrap at end of ring).
+// Count fields of SDMA commands are 0-based.
+typedef BlitSdma<uint32_t, false, 0> BlitSdmaV2V3;
+
+// Ring indices are 64-bit.
+// HW ring indices are monotonic (do not wrap at end of ring).
+// Count fields of SDMA commands are 1-based.
+typedef BlitSdma<uint64_t, true, -1>  BlitSdmaV4;
+
 }  // namespace amd
 
 #endif  // header guard

@@ -40,24 +40,55 @@
 //
 ////////////////////////////////////////////////////////////////////////////////
 
-module &m:1:0:$full:$large:$default;
+#include "core/inc/ipc_signal.h"
 
-decl prog function &abort()();
+#include <utility>
 
-prog kernel &__vector_copy_kernel(
-	kernarg_u64 %in,
-	kernarg_u64 %out)
-{
-@__vector_copy_kernel_entry:
-	// BB#0:                                // %entry
-	workitemabsid_u32	$s0, 0;
-	cvt_s64_s32	$d0, $s0;
-	shl_u64	$d0, $d0, 2;
-	ld_kernarg_align(8)_width(all)_u64	$d1, [%out];
-	add_u64	$d1, $d1, $d0;
-	ld_kernarg_align(8)_width(all)_u64	$d2, [%in];
-	add_u64	$d0, $d2, $d0;
-	ld_global_u32	$s0, [$d0];
-	st_global_u32	$s0, [$d1];
-	ret;
-};
+#include "core/inc/runtime.h"
+#include "core/inc/exceptions.h"
+
+namespace core {
+
+int IPCSignal::rtti_id_ = 0;
+KernelMutex IPCSignal::lock_;
+
+SharedMemory::SharedMemory(const hsa_amd_ipc_memory_t* handle, size_t len) {
+  hsa_status_t err = Runtime::runtime_singleton_->IPCAttach(handle, len, 0, NULL, &ptr_);
+  if (err != HSA_STATUS_SUCCESS) throw AMD::hsa_exception(err, "IPC memory attach failed.");
+}
+
+SharedMemory::SharedMemory(SharedMemory&& rhs) {
+  ptr_ = rhs.ptr_;
+  rhs.ptr_ = nullptr;
+}
+
+SharedMemory::~SharedMemory() {
+  if (ptr_ == nullptr) return;
+  auto err = Runtime::runtime_singleton_->IPCDetach(ptr_);
+  assert(err == HSA_STATUS_SUCCESS && "IPC detach failed.");
+}
+
+void IPCSignal::CreateHandle(Signal* signal, hsa_amd_ipc_signal_t* ipc_handle) {
+  if (!signal->isIPC())
+    throw AMD::hsa_exception(HSA_STATUS_ERROR_INVALID_ARGUMENT, "Signal must be IPC enabled.");
+  SharedSignal* shared = SharedSignal::Convert(Convert(signal));
+  hsa_status_t err = Runtime::runtime_singleton_->IPCCreate(shared, 4096, ipc_handle);
+  if (err != HSA_STATUS_SUCCESS) throw AMD::hsa_exception(err, "IPC memory create failed.");
+}
+
+Signal* IPCSignal::Attach(const hsa_amd_ipc_signal_t* ipc_signal_handle) {
+  SharedMemorySignal shared(ipc_signal_handle);
+
+  if (!(shared.signal()->IsIPC()))
+    throw AMD::hsa_exception(HSA_STATUS_ERROR_INVALID_ARGUMENT,
+                             "IPC memory does not contain an IPC signal abi block.");
+
+  hsa_signal_t handle = SharedSignal::Convert(shared.signal());
+
+  ScopedAcquire<KernelMutex> lock(&lock_);
+  Signal* ret = core::Signal::DuplicateHandle(handle);
+  if (ret == nullptr) ret = new IPCSignal(std::move(shared));
+  return ret;
+}
+
+}  // namespace core

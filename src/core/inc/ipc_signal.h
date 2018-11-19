@@ -40,48 +40,73 @@
 //
 ////////////////////////////////////////////////////////////////////////////////
 
-#ifndef AMD_HSA_QUEUE_H
-#define AMD_HSA_QUEUE_H
+#ifndef HSA_RUNTME_CORE_INC_IPC_SIGNAL_H_
+#define HSA_RUNTME_CORE_INC_IPC_SIGNAL_H_
 
-#include "amd_hsa_common.h"
-#include "hsa.h"
+#include <atomic>
+#include <utility>
 
-// AMD Queue Properties.
-typedef uint32_t amd_queue_properties32_t;
-enum amd_queue_properties_t {
-  AMD_HSA_BITS_CREATE_ENUM_ENTRIES(AMD_QUEUE_PROPERTIES_ENABLE_TRAP_HANDLER, 0, 1),
-  AMD_HSA_BITS_CREATE_ENUM_ENTRIES(AMD_QUEUE_PROPERTIES_IS_PTR64, 1, 1),
-  AMD_HSA_BITS_CREATE_ENUM_ENTRIES(AMD_QUEUE_PROPERTIES_ENABLE_TRAP_HANDLER_DEBUG_SGPRS, 2, 1),
-  AMD_HSA_BITS_CREATE_ENUM_ENTRIES(AMD_QUEUE_PROPERTIES_ENABLE_PROFILING, 3, 1),
-  AMD_HSA_BITS_CREATE_ENUM_ENTRIES(AMD_QUEUE_PROPERTIES_USE_SCRATCH_ONCE, 4, 1),
-  AMD_HSA_BITS_CREATE_ENUM_ENTRIES(AMD_QUEUE_PROPERTIES_RESERVED1, 5, 27)
+#include "core/inc/signal.h"
+#include "core/inc/default_signal.h"
+#include "core/util/locks.h"
+
+namespace core {
+
+/// @brief Container for ipc shared memory.
+class SharedMemory {
+ public:
+  SharedMemory(const hsa_amd_ipc_memory_t* handle, size_t len);
+  ~SharedMemory();
+  SharedMemory(SharedMemory&&);
+
+  void* ptr() const { return ptr_; }
+
+ private:
+  void* ptr_;
 };
 
-// AMD Queue.
-#define AMD_QUEUE_ALIGN_BYTES 64
-#define AMD_QUEUE_ALIGN __ALIGNED__(AMD_QUEUE_ALIGN_BYTES)
-typedef struct AMD_QUEUE_ALIGN amd_queue_s {
-  hsa_queue_t hsa_queue;
-  uint32_t reserved1[4];
-  volatile uint64_t write_dispatch_id;
-  uint32_t group_segment_aperture_base_hi;
-  uint32_t private_segment_aperture_base_hi;
-  uint32_t max_cu_id;
-  uint32_t max_wave_id;
-  volatile uint64_t max_legacy_doorbell_dispatch_id_plus_1;
-  volatile uint32_t legacy_doorbell_lock;
-  uint32_t reserved2[9];
-  volatile uint64_t read_dispatch_id;
-  uint32_t read_dispatch_id_field_base_byte_offset;
-  uint32_t compute_tmpring_size;
-  uint32_t scratch_resource_descriptor[4];
-  uint64_t scratch_backing_memory_location;
-  uint64_t scratch_backing_memory_byte_size;
-  uint32_t scratch_workitem_byte_size;
-  amd_queue_properties32_t queue_properties;
-  uint32_t reserved3[2];
-  hsa_signal_t queue_inactive_signal;
-  uint32_t reserved4[14];
-} amd_queue_t;
+/// @brief Container for ipc signal abi block.
+class SharedMemorySignal {
+ public:
+  explicit SharedMemorySignal(const hsa_amd_ipc_memory_t* handle) : signal_(handle, 4096) {
+    if (!signal()->IsValid())
+      throw AMD::hsa_exception(HSA_STATUS_ERROR_INVALID_ARGUMENT, "IPC Signal handle is invalid.");
+  }
+  SharedSignal* signal() const { return reinterpret_cast<SharedSignal*>(signal_.ptr()); }
 
-#endif // AMD_HSA_QUEUE_H
+ private:
+  SharedMemory signal_;
+};
+
+/// @brief Memory only signal using a shared memory ABI block.
+class IPCSignal : private SharedMemorySignal, public BusyWaitSignal {
+ public:
+  /// @brief Creates a sharable handle for an IPC enabled signal.
+  static void CreateHandle(Signal* signal, hsa_amd_ipc_signal_t* ipc_handle);
+
+  /// @brief Opens an IPC signal from its IPC handle.
+  static Signal* Attach(const hsa_amd_ipc_signal_t* ipc_handle);
+
+  /// @brief Determines if a Signal* can be safely converted to BusyWaitSignal*
+  /// via static_cast.
+  static __forceinline bool IsType(Signal* ptr) { return ptr->IsType(&rtti_id_); }
+
+ protected:
+  bool _IsA(rtti_t id) const {
+    if (id == &rtti_id_) return true;
+    return BusyWaitSignal::_IsA(id);
+  }
+
+ private:
+  static int rtti_id_;
+  static KernelMutex lock_;
+
+  explicit IPCSignal(SharedMemorySignal&& abi_block)
+      : SharedMemorySignal(std::move(abi_block)), BusyWaitSignal(signal(), true) {}
+
+  DISALLOW_COPY_AND_ASSIGN(IPCSignal);
+};
+
+}  // namespace core
+
+#endif  // HSA_RUNTME_CORE_INC_IPC_SIGNAL_H_

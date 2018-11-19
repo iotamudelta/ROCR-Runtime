@@ -49,6 +49,8 @@
 #include <map>
 #include <string>
 #include <vector>
+#include <memory>
+#include <utility>
 
 #include "core/inc/amd_aql_queue.h"
 #include "core/inc/amd_blit_kernel.h"
@@ -59,8 +61,9 @@
 #include "core/inc/interrupt_signal.h"
 #include "core/inc/isa.h"
 #include "core/inc/runtime.h"
-
+#include "core/util/os.h"
 #include "hsa_ext_image.h"
+#include "inc/hsa_ven_amd_aqlprofile.h"
 
 // Size of scratch (private) segment pre-allocated per thread, in bytes.
 #define DEFAULT_SCRATCH_BYTES_PER_THREAD 2048
@@ -82,7 +85,6 @@ GpuAgent::GpuAgent(HSAuint32 node, const HsaNodeProperties& node_props)
       memory_max_frequency_(0),
       ape1_base_(0),
       ape1_size_(0),
-      blit_initialized_(false),
       end_ts_pool_size_(0),
       end_ts_pool_counter_(0),
       end_ts_base_addr_(NULL) {
@@ -96,7 +98,7 @@ GpuAgent::GpuAgent(HSAuint32 node, const HsaNodeProperties& node_props)
   // Set instruction set architecture via node property, only on GPU device.
   isa_ = (core::Isa*)core::IsaRegistry::GetIsa(core::Isa::Version(
       node_props.EngineId.ui32.Major, node_props.EngineId.ui32.Minor,
-      node_props.EngineId.ui32.Stepping));
+      node_props.EngineId.ui32.Stepping), profile_ == HSA_PROFILE_FULL);
 
   // Check if the device is Kaveri, only on GPU device.
   if (isa_->GetMajorVersion() == 7 && isa_->GetMinorVersion() == 0 &&
@@ -130,15 +132,10 @@ GpuAgent::GpuAgent(HSAuint32 node, const HsaNodeProperties& node_props)
 
 GpuAgent::~GpuAgent() {
   for (int i = 0; i < BlitCount; ++i) {
-    if (blits_[i] != NULL) {
+    if (blits_[i] != nullptr) {
       hsa_status_t status = blits_[i]->Destroy(*this);
       assert(status == HSA_STATUS_SUCCESS);
-      delete blits_[i];
     }
-  }
-
-  for (int i = 0; i < QueueCount; ++i) {
-    delete queues_[i];
   }
 
   if (end_ts_base_addr_ != NULL) {
@@ -175,20 +172,34 @@ void GpuAgent::AssembleShader(const char* src_sp3, const char* func_name,
   struct CompiledShader {
     ASICShader compute_7;
     ASICShader compute_8;
+    ASICShader compute_9;
   };
 
   std::map<std::string, CompiledShader> compiled_shaders = {
       {"TrapHandler",
-       {{NULL, 0, 0, 0}, {kCodeTrapHandler8, sizeof(kCodeTrapHandler8), 2, 4}}},
+       {
+           {NULL, 0, 0, 0},
+           {kCodeTrapHandler8, sizeof(kCodeTrapHandler8), 2, 4},
+           {kCodeTrapHandler9, sizeof(kCodeTrapHandler9), 2, 4},
+       }},
       {"CopyAligned",
-       {{kCodeCopyAligned7, sizeof(kCodeCopyAligned7), 32, 12},
-        {kCodeCopyAligned8, sizeof(kCodeCopyAligned8), 32, 12}}},
+       {
+           {kCodeCopyAligned7, sizeof(kCodeCopyAligned7), 32, 12},
+           {kCodeCopyAligned8, sizeof(kCodeCopyAligned8), 32, 12},
+           {kCodeCopyAligned8, sizeof(kCodeCopyAligned8), 32, 12},
+       }},
       {"CopyMisaligned",
-       {{kCodeCopyMisaligned7, sizeof(kCodeCopyMisaligned7), 23, 10},
-        {kCodeCopyMisaligned8, sizeof(kCodeCopyMisaligned8), 23, 10}}},
+       {
+           {kCodeCopyMisaligned7, sizeof(kCodeCopyMisaligned7), 23, 10},
+           {kCodeCopyMisaligned8, sizeof(kCodeCopyMisaligned8), 23, 10},
+           {kCodeCopyMisaligned8, sizeof(kCodeCopyMisaligned8), 23, 10},
+       }},
       {"Fill",
-       {{kCodeFill7, sizeof(kCodeFill7), 19, 8},
-        {kCodeFill8, sizeof(kCodeFill8), 19, 8}}}};
+       {
+           {kCodeFill7, sizeof(kCodeFill7), 19, 8},
+           {kCodeFill8, sizeof(kCodeFill8), 19, 8},
+           {kCodeFill8, sizeof(kCodeFill8), 19, 8},
+       }}};
 
   auto compiled_shader_it = compiled_shaders.find(func_name);
   assert(compiled_shader_it != compiled_shaders.end() &&
@@ -202,6 +213,9 @@ void GpuAgent::AssembleShader(const char* src_sp3, const char* func_name,
       break;
     case 8:
       asic_shader = &compiled_shader_it->second.compute_8;
+      break;
+    case 9:
+      asic_shader = &compiled_shader_it->second.compute_9;
       break;
     default:
       assert(false && "Precompiled shader unavailable for target");
@@ -318,7 +332,6 @@ void GpuAgent::InitScratchPool() {
   // scratch/thread
   const uint32_t num_cu =
       properties_.NumFComputeCores / properties_.NumSIMDPerCU;
-  queue_scratch_len_ = 0;
   queue_scratch_len_ = AlignUp(32 * 64 * num_cu * scratch_per_thread_, 65536);
   size_t max_scratch_len = queue_scratch_len_ * max_queues_;
 
@@ -340,7 +353,7 @@ void GpuAgent::InitScratchPool() {
   if (HSAKMT_STATUS_SUCCESS == err) {
     new (&scratch_pool_) SmallHeap(scratch_base, max_scratch_len);
   } else {
-    new (&scratch_pool_) SmallHeap(NULL, 0);
+    new (&scratch_pool_) SmallHeap();
   }
 }
 
@@ -389,9 +402,9 @@ bool GpuAgent::InitEndTsPool() {
     return true;
   }
 
-  end_ts_pool_size_ = static_cast<uint32_t>(
-      (BlitSdma::kQueueSize + BlitSdma::kCopyPacketSize - 1) /
-      (BlitSdma::kCopyPacketSize));
+  end_ts_pool_size_ =
+      static_cast<uint32_t>((BlitSdmaBase::kQueueSize + BlitSdmaBase::kCopyPacketSize - 1) /
+                            (BlitSdmaBase::kCopyPacketSize));
 
   // Allocate end timestamp object for both h2d and d2h DMA.
   const size_t alloc_size = 2 * end_ts_pool_size_ * kTsSize;
@@ -434,8 +447,9 @@ hsa_status_t GpuAgent::IterateRegion(
 
 hsa_status_t GpuAgent::IterateCache(hsa_status_t (*callback)(hsa_cache_t cache, void* data),
                                     void* data) const {
+  AMD::callback_t<decltype(callback)> call(callback);
   for (size_t i = 0; i < caches_.size(); i++) {
-    hsa_status_t stat = callback(core::Cache::Convert(caches_[i].get()), data);
+    hsa_status_t stat = call(core::Cache::Convert(caches_[i].get()), data);
     if (stat != HSA_STATUS_SUCCESS) return stat;
   }
   return HSA_STATUS_SUCCESS;
@@ -476,6 +490,7 @@ hsa_status_t GpuAgent::VisitRegion(
     const std::vector<const core::MemoryRegion*>& regions,
     hsa_status_t (*callback)(hsa_region_t region, void* data),
     void* data) const {
+  AMD::callback_t<decltype(callback)> call(callback);
   for (const core::MemoryRegion* region : regions) {
     const amd::MemoryRegion* amd_region =
         reinterpret_cast<const amd::MemoryRegion*>(region);
@@ -484,7 +499,7 @@ hsa_status_t GpuAgent::VisitRegion(
     if (amd_region->IsSystem() || amd_region->IsLocalMemory() ||
         amd_region->IsLDS()) {
       hsa_region_t region_handle = core::MemoryRegion::Convert(region);
-      hsa_status_t status = callback(region_handle, data);
+      hsa_status_t status = call(region_handle, data);
       if (status != HSA_STATUS_SUCCESS) {
         return status;
       }
@@ -495,22 +510,20 @@ hsa_status_t GpuAgent::VisitRegion(
 }
 
 core::Queue* GpuAgent::CreateInterceptibleQueue() {
-  // Until tools runtime is merged in we need to use HSA API
-  // rather than GpuAgent::QueueCreate to allow interception.
-  hsa_queue_t* queue_handle;
-  hsa_status_t status =
-      HSA::hsa_queue_create(public_handle(), minAqlSize_, HSA_QUEUE_TYPE_MULTI,
-                            NULL, NULL, 0, 0, &queue_handle);
-
-  if (status != HSA_STATUS_SUCCESS) {
-    return NULL;
-  }
-
-  return core::Queue::Convert(queue_handle);
+  // Disabled intercept of internal queues pending tools updates.
+  core::Queue* queue = nullptr;
+  QueueCreate(minAqlSize_, HSA_QUEUE_TYPE_MULTI, NULL, NULL, 0, 0, &queue);
+  return queue;
 }
 
-core::Blit* GpuAgent::CreateBlitSdma() {
-  BlitSdma* sdma = new BlitSdma();
+core::Blit* GpuAgent::CreateBlitSdma(bool h2d) {
+  core::Blit* sdma;
+
+  if (isa_->GetMajorVersion() <= 8) {
+    sdma = new BlitSdmaV2V3(h2d);
+  } else {
+    sdma = new BlitSdmaV4(h2d);
+  }
 
   if (sdma->Initialize(*this) != HSA_STATUS_SUCCESS) {
     sdma->Destroy(*this);
@@ -534,64 +547,59 @@ core::Blit* GpuAgent::CreateBlitKernel(core::Queue* queue) {
 }
 
 void GpuAgent::InitDma() {
-  // This provides the ability to lazy init the blit objects on places that
-  // could give indication of DMA usage in the future. E.g.:
-  // 1. Call to allow access API.
-  // 2. Call to memory lock API.
-  if (!blit_initialized_.load(std::memory_order_acquire)) {
-    ScopedAcquire<KernelMutex> lock(&blit_lock_);
-    if (!blit_initialized_.load(std::memory_order_relaxed)) {
-      // Try create SDMA blit first.
-      if (core::Runtime::runtime_singleton_->flag().enable_sdma() &&
-          (HSA_PROFILE_BASE == profile_)) {
-        blits_[BlitHostToDev] = CreateBlitSdma();
-        blits_[BlitDevToHost] = CreateBlitSdma();
+  // Setup lazy init pointers on queues and blits.
+  auto queue_lambda = [this]() {
+    auto ret = CreateInterceptibleQueue();
+    if (ret == nullptr)
+      throw AMD::hsa_exception(HSA_STATUS_ERROR_OUT_OF_RESOURCES,
+                               "Internal queue creation failed.");
+    return ret;
+  };
+  // Dedicated compute queue for host-to-device blits.
+  queues_[QueueBlitOnly].reset(queue_lambda);
+  // Share utility queue with device-to-host blits.
+  queues_[QueueUtility].reset(queue_lambda);
 
-        if (blits_[BlitHostToDev] != NULL && blits_[BlitDevToHost] != NULL) {
-          blit_initialized_.store(true, std::memory_order_release);
-          return;
-        }
-      }
+  // Decide which engine to use for blits.
+  auto blit_lambda = [this](bool h2d, lazy_ptr<core::Queue>& queue) {
+    const std::string& sdma_override = core::Runtime::runtime_singleton_->flag().enable_sdma();
 
-      // Fall back to blit kernel if SDMA is unavailable.
-      if (blits_[BlitHostToDev] == NULL) {
-        // Create a dedicated compute queue for host-to-device blits.
-        queues_[QueueBlitOnly] = CreateInterceptibleQueue();
-        assert(queues_[QueueBlitOnly] != NULL && "Queue creation failed");
+    // Per-ASIC disables for firmware stability.
+    bool use_sdma = (isa_->GetMajorVersion() != 8) && (isa_->version() != core::Isa::Version(9, 0, 6));
+    if (sdma_override.size() != 0) use_sdma = (sdma_override == "1");
 
-        blits_[BlitHostToDev] = CreateBlitKernel(queues_[QueueBlitOnly]);
-        assert(blits_[BlitHostToDev] != NULL && "Blit creation failed");
-      }
-
-      if (blits_[BlitDevToHost] == NULL) {
-        // Share utility queue with device-to-host blits.
-        blits_[BlitDevToHost] = CreateBlitKernel(queues_[QueueUtility]);
-        assert(blits_[BlitDevToHost] != NULL && "Blit creation failed");
-      }
-
-      blit_initialized_.store(true, std::memory_order_release);
+    if (use_sdma && (HSA_PROFILE_BASE == profile_)) {
+      auto ret = CreateBlitSdma(h2d);
+      if (ret != nullptr) return ret;
     }
-  }
+
+    auto ret = CreateBlitKernel((*queue).get());
+    if (ret == nullptr)
+      throw AMD::hsa_exception(HSA_STATUS_ERROR_OUT_OF_RESOURCES, "Blit creation failed.");
+    return ret;
+  };
+
+  blits_[BlitHostToDev].reset([blit_lambda, this]() { return blit_lambda(true, queues_[QueueBlitOnly]); });
+  blits_[BlitDevToHost].reset([blit_lambda, this]() { return blit_lambda(false, queues_[QueueUtility]); });
+  blits_[BlitDevToDev].reset([this]() {
+    auto ret = CreateBlitKernel((*queues_[QueueUtility]).get());
+    if (ret == nullptr)
+      throw AMD::hsa_exception(HSA_STATUS_ERROR_OUT_OF_RESOURCES, "Blit creation failed.");
+    return ret;
+  });
+}
+
+void GpuAgent::PreloadBlits() {
+  blits_[BlitHostToDev].touch();
+  blits_[BlitDevToHost].touch();
+  blits_[BlitDevToDev].touch();
 }
 
 hsa_status_t GpuAgent::PostToolsInit() {
   // Defer memory allocation until agents have been discovered.
   InitScratchPool();
   BindTrapHandler();
-
-  // Defer utility queue creation to allow tools to intercept.
-  queues_[QueueUtility] = CreateInterceptibleQueue();
-
-  if (queues_[QueueUtility] == NULL) {
-    return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
-  }
-
-  // Share utility queue with device-to-device blits.
-  blits_[BlitDevToDev] = CreateBlitKernel(queues_[QueueUtility]);
-
-  if (blits_[BlitDevToDev] == NULL) {
-    return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
-  }
+  InitDma();
 
   return HSA_STATUS_SUCCESS;
 }
@@ -605,27 +613,23 @@ hsa_status_t GpuAgent::DmaCopy(void* dst, core::Agent& dst_agent,
                                size_t size,
                                std::vector<core::Signal*>& dep_signals,
                                core::Signal& out_signal) {
-  core::Blit* blit =
-      (src_agent.device_type() == core::Agent::kAmdCpuDevice &&
-       dst_agent.device_type() == core::Agent::kAmdGpuDevice)
-          ? blits_[BlitHostToDev]
-          : (src_agent.device_type() == core::Agent::kAmdGpuDevice &&
-             dst_agent.device_type() == core::Agent::kAmdCpuDevice)
-                ? blits_[BlitDevToHost]
-                : blits_[BlitDevToDev];
+  lazy_ptr<core::Blit>& blit =
+    (src_agent.device_type() == core::Agent::kAmdCpuDevice &&
+     dst_agent.device_type() == core::Agent::kAmdGpuDevice)
+       ? blits_[BlitHostToDev]
+       : (src_agent.device_type() == core::Agent::kAmdGpuDevice &&
+          dst_agent.device_type() == core::Agent::kAmdCpuDevice)
+            ? blits_[BlitDevToHost]
+            : (src_agent.node_id() == dst_agent.node_id())
+              ? blits_[BlitDevToDev] : blits_[BlitDevToHost];
 
-  if (blit == NULL) {
-    return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
-  }
-
-  hsa_status_t stat =
-      blit->SubmitLinearCopyCommand(dst, src, size, dep_signals, out_signal);
-
-  if (profiling_enabled() && HSA_STATUS_SUCCESS == stat) {
+  if (profiling_enabled()) {
     // Track the agent so we could translate the resulting timestamp to system
     // domain correctly.
-    out_signal.async_copy_agent(this);
+    out_signal.async_copy_agent(core::Agent::Convert(this->public_handle()));
   }
+
+  hsa_status_t stat = blit->SubmitLinearCopyCommand(dst, src, size, dep_signals, out_signal);
 
   return stat;
 }
@@ -726,7 +730,7 @@ hsa_status_t GpuAgent::GetInfo(hsa_agent_info_t attribute, void* value) const {
       *((uint32_t*)value) = maxAqlSize_;
       break;
     case HSA_AGENT_INFO_QUEUE_TYPE:
-      *((hsa_queue_type_t*)value) = HSA_QUEUE_TYPE_MULTI;
+      *((hsa_queue_type32_t*)value) = HSA_QUEUE_TYPE_MULTI;
       break;
     case HSA_AGENT_INFO_NODE:
       // TODO: associate with OS NUMA support (numactl / GetNumaProcessorNode).
@@ -760,6 +764,11 @@ hsa_status_t GpuAgent::GetInfo(hsa_agent_info_t attribute, void* value) const {
 
       if (core::hsa_internal_api_table_.image_api.hsa_ext_image_create_fn != NULL) {
         setFlag(HSA_EXTENSION_IMAGES);
+      }
+
+      if (os::LibHandle lib = os::LoadLib(kAqlProfileLib)) {
+        os::CloseLib(lib);
+        setFlag(HSA_EXTENSION_AMD_AQLPROFILE);
       }
 
       setFlag(HSA_EXTENSION_AMD_PROFILER);
@@ -840,6 +849,15 @@ hsa_status_t GpuAgent::GetInfo(hsa_agent_info_t attribute, void* value) const {
       *((uint32_t*)value) = static_cast<uint32_t>(
           properties_.NumSIMDPerCU * properties_.MaxWavesPerSIMD);
       break;
+    case HSA_AMD_AGENT_INFO_NUM_SIMDS_PER_CU:
+      *((uint32_t*)value) = properties_.NumSIMDPerCU;
+      break;
+    case HSA_AMD_AGENT_INFO_NUM_SHADER_ENGINES:
+      *((uint32_t*)value) = properties_.NumShaderBanks;
+      break;
+    case HSA_AMD_AGENT_INFO_NUM_SHADER_ARRAYS_PER_SE:
+      *((uint32_t*)value) = properties_.NumArrays;
+      break;
     default:
       return HSA_STATUS_ERROR_INVALID_ARGUMENT;
       break;
@@ -847,7 +865,7 @@ hsa_status_t GpuAgent::GetInfo(hsa_agent_info_t attribute, void* value) const {
   return HSA_STATUS_SUCCESS;
 }
 
-hsa_status_t GpuAgent::QueueCreate(size_t size, hsa_queue_type_t queue_type,
+hsa_status_t GpuAgent::QueueCreate(size_t size, hsa_queue_type32_t queue_type,
                                    core::HsaEventCallback event_callback,
                                    void* data, uint32_t private_segment_size,
                                    uint32_t group_segment_size,
@@ -864,89 +882,148 @@ hsa_status_t GpuAgent::QueueCreate(size_t size, hsa_queue_type_t queue_type,
 
   // Allocate scratch memory
   ScratchInfo scratch;
-#if defined(HSA_LARGE_MODEL) && defined(__linux__)
-  if (core::g_use_interrupt_wait) {
-    if (private_segment_size == UINT_MAX) {
-      private_segment_size =
-          (profile_ == HSA_PROFILE_BASE) ? 0 : scratch_per_thread_;
-    }
-
-    if (private_segment_size > 262128) {
-      return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
-    }
-
-    scratch.size_per_thread = AlignUp(private_segment_size, 16);
-    if (scratch.size_per_thread > 262128) {
-      return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
-    }
-
-    const uint32_t num_cu =
-        properties_.NumFComputeCores / properties_.NumSIMDPerCU;
-    scratch.size = scratch.size_per_thread * 32 * 64 * num_cu;
-  } else {
-    scratch.size = queue_scratch_len_;
-    scratch.size_per_thread = scratch_per_thread_;
+  if (private_segment_size == UINT_MAX) {
+    private_segment_size = (profile_ == HSA_PROFILE_BASE) ? 0 : scratch_per_thread_;
   }
-#else
-  scratch.size = queue_scratch_len_;
-  scratch.size_per_thread = scratch_per_thread_;
-#endif
-  scratch.queue_base = NULL;
+
+  if (private_segment_size > 262128) {
+    return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+  }
+
+  scratch.size_per_thread = AlignUp(private_segment_size, 16);
+  if (scratch.size_per_thread > 262128) {
+    return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+  }
+
+  const uint32_t num_cu = properties_.NumFComputeCores / properties_.NumSIMDPerCU;
+  scratch.size = scratch.size_per_thread * 32 * 64 * num_cu;
+  scratch.queue_base = nullptr;
+  scratch.queue_process_offset = 0;
+
+  MAKE_NAMED_SCOPE_GUARD(scratchGuard, [&]() { ReleaseQueueScratch(scratch); });
+
   if (scratch.size != 0) {
     AcquireQueueScratch(scratch);
-    if (scratch.queue_base == NULL) {
+    if (scratch.queue_base == nullptr) {
       return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
     }
   }
 
+  // Ensure utility queue has been created.
+  // Deferring longer risks exhausting queue count before ISA upload and invalidation capability is
+  // ensured.
+  queues_[QueueUtility].touch();
+
   // Create an HW AQL queue
-  AqlQueue* hw_queue = new AqlQueue(this, size, node_id(), scratch,
-                                    event_callback, data, is_kv_device_);
-  if (hw_queue && hw_queue->IsValid()) {
-    // return queue
-    *queue = hw_queue;
-    return HSA_STATUS_SUCCESS;
-  }
-  // If reached here its always an ERROR.
-  delete hw_queue;
-  ReleaseQueueScratch(scratch.queue_base);
-  return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+  *queue = new AqlQueue(this, size, node_id(), scratch, event_callback, data, is_kv_device_);
+  scratchGuard.Dismiss();
+  return HSA_STATUS_SUCCESS;
 }
 
 void GpuAgent::AcquireQueueScratch(ScratchInfo& scratch) {
+  bool need_queue_scratch_base = (isa_->GetMajorVersion() > 8);
+
   if (scratch.size == 0) {
     scratch.size = queue_scratch_len_;
     scratch.size_per_thread = scratch_per_thread_;
   }
 
-  ScopedAcquire<KernelMutex> lock(&scratch_lock_);
-  scratch.queue_base = scratch_pool_.alloc(scratch.size);
-  scratch.queue_process_offset =
-      uintptr_t(scratch.queue_base) - uintptr_t(scratch_pool_.base());
+  scratch.retry = false;
 
-  if ((scratch.queue_base != NULL) && (profile_ == HSA_PROFILE_BASE)) {
-    HSAuint64 alternate_va;
-    if (HSAKMT_STATUS_SUCCESS !=
-        hsaKmtMapMemoryToGPU(scratch.queue_base, scratch.size, &alternate_va)) {
-      assert(false && "Map scratch subrange failed!");
-      scratch_pool_.free(scratch.queue_base);
-      scratch.queue_base = NULL;
+  ScopedAcquire<KernelMutex> lock(&scratch_lock_);
+  // Limit to 1/8th of scratch pool for small scratch and 1/4 of that for a single queue.
+  size_t small_limit = scratch_pool_.size() >> 3;
+  size_t single_limit = small_limit >> 2;
+  bool large = (scratch.size > single_limit) ||
+      (scratch_pool_.size() - scratch_pool_.remaining() + scratch.size > small_limit);
+  large = (isa_->GetMajorVersion() < 8) ? false : large;
+  if (large)
+    scratch.queue_base = scratch_pool_.alloc_high(scratch.size);
+  else
+    scratch.queue_base = scratch_pool_.alloc(scratch.size);
+  large |= scratch.queue_base > scratch_pool_.high_split();
+  scratch.large = large;
+
+  scratch.queue_process_offset =
+      (need_queue_scratch_base)
+          ? uintptr_t(scratch.queue_base)
+          : uintptr_t(scratch.queue_base) - uintptr_t(scratch_pool_.base());
+
+  if (scratch.queue_base != nullptr) {
+    if (profile_ == HSA_PROFILE_FULL) return;
+    if (profile_ == HSA_PROFILE_BASE) {
+      HSAuint64 alternate_va;
+      if (hsaKmtMapMemoryToGPU(scratch.queue_base, scratch.size, &alternate_va) ==
+          HSAKMT_STATUS_SUCCESS) {
+        if (large) scratch_used_large_ += scratch.size;
+        return;
+      }
     }
   }
+
+  // Scratch request failed allocation or mapping.
+  scratch_pool_.free(scratch.queue_base);
+  scratch.queue_base = nullptr;
+
+  // Retry if large may yield needed space.
+  if (scratch_used_large_ != 0) {
+    scratch.retry = true;
+    return;
+  }
+
+  // Attempt to trim the maximum number of concurrent waves to allow scratch to fit.
+  if (core::Runtime::runtime_singleton_->flag().enable_queue_fault_message())
+    debug_print("Failed to map requested scratch - reducing queue occupancy.\n");
+  uint64_t num_cus = properties_.NumFComputeCores / properties_.NumSIMDPerCU;
+  uint64_t size_per_wave = AlignUp(scratch.size_per_thread * properties_.WaveFrontSize, 1024);
+  uint64_t total_waves = scratch.size / size_per_wave;
+  uint64_t waves_per_cu = total_waves / num_cus;
+  while (waves_per_cu != 0) {
+    size_t size = waves_per_cu * num_cus * size_per_wave;
+    void* base = scratch_pool_.alloc(size);
+    HSAuint64 alternate_va;
+    if ((base != nullptr) &&
+        ((profile_ == HSA_PROFILE_FULL) ||
+         (hsaKmtMapMemoryToGPU(base, size, &alternate_va) == HSAKMT_STATUS_SUCCESS))) {
+      // Scratch allocated and either full profile or map succeeded.
+      scratch.queue_base = base;
+      scratch.size = size;
+      scratch.queue_process_offset =
+          (need_queue_scratch_base)
+              ? uintptr_t(scratch.queue_base)
+              : uintptr_t(scratch.queue_base) - uintptr_t(scratch_pool_.base());
+      scratch.large = true;
+      scratch_used_large_ += scratch.size;
+      return;
+    }
+    scratch_pool_.free(base);
+    waves_per_cu--;
+  }
+
+  // Failed to allocate minimal scratch
+  assert(scratch.queue_base == nullptr && "bad scratch data");
+  if (core::Runtime::runtime_singleton_->flag().enable_queue_fault_message())
+    debug_print("Could not allocate scratch for one wave per CU.\n");
 }
 
-void GpuAgent::ReleaseQueueScratch(void* base) {
-  if (base == NULL) {
+void GpuAgent::ReleaseQueueScratch(ScratchInfo& scratch) {
+  if (scratch.queue_base == nullptr) {
     return;
   }
 
   ScopedAcquire<KernelMutex> lock(&scratch_lock_);
   if (profile_ == HSA_PROFILE_BASE) {
-    if (HSAKMT_STATUS_SUCCESS != hsaKmtUnmapMemoryToGPU(base)) {
+    if (HSAKMT_STATUS_SUCCESS != hsaKmtUnmapMemoryToGPU(scratch.queue_base)) {
       assert(false && "Unmap scratch subrange failed!");
     }
   }
-  scratch_pool_.free(base);
+  scratch_pool_.free(scratch.queue_base);
+
+  if (scratch.large) scratch_used_large_ -= scratch.size;
+
+  // Notify waiters that additional scratch may be available.
+  for (auto notifier : scratch_notifiers_)
+    HSA::hsa_signal_or_relaxed(notifier.first, notifier.second);
 }
 
 void GpuAgent::TranslateTime(core::Signal* signal,
@@ -1020,6 +1097,10 @@ bool GpuAgent::current_coherency_type(hsa_amd_coherency_type_t type) {
 
 uint16_t GpuAgent::GetMicrocodeVersion() const {
   return (properties_.EngineId.ui32.uCode);
+}
+
+uint16_t GpuAgent::GetSdmaMicrocodeVersion() const {
+  return (properties_.uCodeEngineVersions.uCodeSDMA);
 }
 
 void GpuAgent::SyncClocks() {
@@ -1120,6 +1201,13 @@ void GpuAgent::InvalidateCodeCaches() {
   } else if (isa_->GetMajorVersion() == 8 && isa_->GetMinorVersion() == 0) {
     if (properties_.EngineId.ui32.uCode < 685) {
       // Microcode is handling code cache invalidation.
+      return;
+    }
+  } else if (isa_->GetMajorVersion() == 9) {
+    if (properties_.EngineId.ui32.uCode < 334) {
+      static std::once_flag once;
+      std::call_once(
+          once, []() { fprintf(stderr, "warning: code cache invalidation not implemented\n"); });
       return;
     }
   } else {

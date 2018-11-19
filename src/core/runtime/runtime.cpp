@@ -50,7 +50,6 @@
 #include <vector>
 
 #include "core/common/shared.h"
-
 #include "core/inc/hsa_ext_interface.h"
 #include "core/inc/amd_cpu_agent.h"
 #include "core/inc/amd_gpu_agent.h"
@@ -59,13 +58,14 @@
 #include "core/inc/signal.h"
 #include "core/inc/interrupt_signal.h"
 #include "core/inc/hsa_ext_amd_impl.h"
-
 #include "core/inc/hsa_api_trace_int.h"
+#include "core/util/os.h"
+#include "inc/hsa_ven_amd_aqlprofile.h"
 
 #define HSA_VERSION_MAJOR 1
 #define HSA_VERSION_MINOR 1
 
-const char rocrbuildid[] __attribute__((unused)) = "ROCR BUILD ID: " STRING(ROCR_BUILD_ID);
+const char rocrbuildid[] __attribute__((used)) = "ROCR BUILD ID: " STRING(ROCR_BUILD_ID);
 
 namespace core {
 bool g_use_interrupt_wait = true;
@@ -108,6 +108,7 @@ hsa_status_t Runtime::Acquire() {
   }
 
   runtime_singleton_->ref_count_++;
+  MAKE_NAMED_SCOPE_GUARD(refGuard, [&]() { runtime_singleton_->ref_count_--; });
 
   if (runtime_singleton_->ref_count_ == 1) {
     hsa_status_t status = runtime_singleton_->Load();
@@ -117,6 +118,7 @@ hsa_status_t Runtime::Acquire() {
     }
   }
 
+  refGuard.Dismiss();
   return HSA_STATUS_SUCCESS;
 }
 
@@ -286,15 +288,13 @@ uint32_t Runtime::GetIndexLinkInfo(uint32_t node_id_from, uint32_t node_id_to) {
 hsa_status_t Runtime::IterateAgent(hsa_status_t (*callback)(hsa_agent_t agent,
                                                             void* data),
                                    void* data) {
-  if (!IsOpen()) {
-    return HSA_STATUS_ERROR_NOT_INITIALIZED;
-  }
+  AMD::callback_t<decltype(callback)> call(callback);
 
   std::vector<core::Agent*>* agent_lists[2] = {&cpu_agents_, &gpu_agents_};
   for (std::vector<core::Agent*>* agent_list : agent_lists) {
     for (size_t i = 0; i < agent_list->size(); ++i) {
       hsa_agent_t agent = Agent::Convert(agent_list->at(i));
-      hsa_status_t status = callback(agent, data);
+      hsa_status_t status = call(agent, data);
 
       if (status != HSA_STATUS_SUCCESS) {
         return status;
@@ -320,11 +320,11 @@ hsa_status_t Runtime::AllocateMemory(const MemoryRegion* region, size_t size,
 }
 
 hsa_status_t Runtime::FreeMemory(void* ptr) {
-  if (ptr == NULL) {
+  if (ptr == nullptr) {
     return HSA_STATUS_SUCCESS;
   }
 
-  const MemoryRegion* region = NULL;
+  const MemoryRegion* region = nullptr;
   size_t size = 0;
   ScopedAcquire<KernelMutex> lock(&memory_lock_);
 
@@ -332,10 +332,16 @@ hsa_status_t Runtime::FreeMemory(void* ptr) {
 
   if (it == allocation_map_.end()) {
     assert(false && "Can't find address in allocation map");
-    return HSA_STATUS_ERROR;
+    return HSA_STATUS_ERROR_INVALID_ARGUMENT;
   }
   region = it->second.region;
   size = it->second.size;
+
+  // Imported fragments can't be released with FreeMemory.
+  if (region == nullptr) {
+    assert(false && "Can't release imported memory with free.");
+    return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+  }
 
   allocation_map_.erase(it);
 
@@ -453,8 +459,42 @@ hsa_status_t Runtime::CopyMemory(void* dst, core::Agent& dst_agent,
 }
 
 hsa_status_t Runtime::FillMemory(void* ptr, uint32_t value, size_t count) {
-  assert(blit_agent_ != NULL);
-  return blit_agent_->DmaFill(ptr, value, count);
+  // Choose blit agent from pointer info
+  hsa_amd_pointer_info_t info;
+  uint32_t agent_count;
+  hsa_agent_t* accessible = nullptr;
+  info.size = sizeof(info);
+  MAKE_SCOPE_GUARD([&]() { free(accessible); });
+  hsa_status_t err = PtrInfo(ptr, &info, malloc, &agent_count, &accessible);
+  if (err != HSA_STATUS_SUCCESS) return err;
+
+  ptrdiff_t endPtr = (ptrdiff_t)ptr + count * sizeof(uint32_t);
+
+  // Check for GPU fill
+  // Selects GPU fill for SVM and Locked allocations if a GPU address is given and is mapped.
+  if (info.agentBaseAddress <= ptr &&
+      endPtr <= (ptrdiff_t)info.agentBaseAddress + info.sizeInBytes) {
+    core::Agent* blit_agent = core::Agent::Convert(info.agentOwner);
+    if (blit_agent->device_type() != core::Agent::DeviceType::kAmdGpuDevice) {
+      blit_agent = nullptr;
+      for (uint32_t i = 0; i < agent_count; i++) {
+        if (core::Agent::Convert(accessible[i])->device_type() ==
+            core::Agent::DeviceType::kAmdGpuDevice) {
+          blit_agent = core::Agent::Convert(accessible[i]);
+          break;
+        }
+      }
+    }
+    if (blit_agent) return blit_agent->DmaFill(ptr, value, count);
+  }
+
+  // Host and unmapped SVM addresses copy via host.
+  if (info.hostBaseAddress <= ptr && endPtr <= (ptrdiff_t)info.hostBaseAddress + info.sizeInBytes) {
+    memset(ptr, value, count * sizeof(uint32_t));
+    return HSA_STATUS_SUCCESS;
+  }
+
+  return HSA_STATUS_ERROR_INVALID_ALLOCATION;
 }
 
 hsa_status_t Runtime::AllowAccess(uint32_t num_agents,
@@ -534,6 +574,11 @@ hsa_status_t Runtime::GetSystemInfo(hsa_system_info_t attribute, void* value) {
         setFlag(HSA_EXTENSION_IMAGES);
       }
 
+      if (os::LibHandle lib = os::LoadLib(kAqlProfileLib)) {
+        os::CloseLib(lib);
+        setFlag(HSA_EXTENSION_AMD_AQLPROFILE);
+      }
+
       setFlag(HSA_EXTENSION_AMD_PROFILER);
 
       break;
@@ -544,16 +589,11 @@ hsa_status_t Runtime::GetSystemInfo(hsa_system_info_t attribute, void* value) {
   return HSA_STATUS_SUCCESS;
 }
 
-uint32_t Runtime::GetQueueId() { return atomic::Increment(&queue_count_); }
-
 hsa_status_t Runtime::SetAsyncSignalHandler(hsa_signal_t signal,
                                             hsa_signal_condition_t cond,
                                             hsa_signal_value_t value,
                                             hsa_amd_signal_handler handler,
                                             void* arg) {
-  // Asyncronous signal handler is only supported when KFD events are on.
-  if (!core::g_use_interrupt_wait) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
-
   // Indicate that this signal is in use.
   if (signal.handle != 0) hsa_signal_handle(signal)->Retain();
 
@@ -604,7 +644,7 @@ hsa_status_t Runtime::InteropMap(uint32_t num_agents, Agent** agents,
     if (num_agents > tinyArraySize) delete[] nodes;
   });
 
-  for (int i = 0; i < num_agents; i++)
+  for (uint32_t i = 0; i < num_agents; i++)
     agents[i]->GetInfo((hsa_agent_info_t)HSA_AMD_AGENT_INFO_DRIVER_NODE_ID,
                        &nodes[i]);
 
@@ -645,62 +685,99 @@ hsa_status_t Runtime::InteropUnmap(void* ptr) {
 }
 
 hsa_status_t Runtime::PtrInfo(void* ptr, hsa_amd_pointer_info_t* info, void* (*alloc)(size_t),
-                              uint32_t* num_agents_accessible, hsa_agent_t** accessible) {
+                              uint32_t* num_agents_accessible, hsa_agent_t** accessible,
+                              PtrInfoBlockData* block_info) {
+  static_assert(static_cast<int>(HSA_POINTER_UNKNOWN) == static_cast<int>(HSA_EXT_POINTER_TYPE_UNKNOWN),
+                "Thunk pointer info mismatch");
+  static_assert(static_cast<int>(HSA_POINTER_ALLOCATED) == static_cast<int>(HSA_EXT_POINTER_TYPE_HSA),
+                "Thunk pointer info mismatch");
+  static_assert(static_cast<int>(HSA_POINTER_REGISTERED_USER) == static_cast<int>(HSA_EXT_POINTER_TYPE_LOCKED),
+                "Thunk pointer info mismatch");
+  static_assert(static_cast<int>(HSA_POINTER_REGISTERED_GRAPHICS) == static_cast<int>(HSA_EXT_POINTER_TYPE_GRAPHICS),
+                "Thunk pointer info mismatch");
+
   HsaPointerInfo thunkInfo;
   uint32_t* mappedNodes;
 
-  // check output struct is at least as large as the first info revision.
-  if (info->size < sizeof(struct hsa_amd_pointer_info_v1_s)) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+  hsa_amd_pointer_info_t retInfo;
+
+  // check output struct has an initialized size.
+  if (info->size == 0) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
 
   bool returnListData =
       ((alloc != nullptr) && (num_agents_accessible != nullptr) && (accessible != nullptr));
-  if (returnListData) {
-    size_t max_agents = cpu_agents_.size() + gpu_agents_.size();
-    mappedNodes = (uint32_t*)alloca(max_agents * sizeof(uint32_t));
-    // memory_lock protects access to the NMappedNodes array since this changes with calls to memory
-    // APIs.
+
+  {  // memory_lock protects access to the NMappedNodes array and fragment user data since these may
+     // change with calls to memory APIs.
     ScopedAcquire<KernelMutex> lock(&memory_lock_);
     hsaKmtQueryPointerInfo(ptr, &thunkInfo);
-    assert(thunkInfo.NMappedNodes <= max_agents &&
-           "PointerInfo: Thunk returned more than all agents in NMappedNodes.");
-    memcpy(mappedNodes, thunkInfo.MappedNodes, thunkInfo.NMappedNodes * sizeof(uint32_t));
-  } else {
-    hsaKmtQueryPointerInfo(ptr, &thunkInfo);
-  }
+    if (returnListData) {
+      assert(thunkInfo.NMappedNodes <= agents_by_node_.size() &&
+             "PointerInfo: Thunk returned more than all agents in NMappedNodes.");
+      mappedNodes = (uint32_t*)alloca(thunkInfo.NMappedNodes * sizeof(uint32_t));
+      memcpy(mappedNodes, thunkInfo.MappedNodes, thunkInfo.NMappedNodes * sizeof(uint32_t));
+    }
+    retInfo.type = (hsa_amd_pointer_type_t)thunkInfo.Type;
+    retInfo.agentBaseAddress = reinterpret_cast<void*>(thunkInfo.GPUAddress);
+    retInfo.hostBaseAddress = thunkInfo.CPUAddress;
+    retInfo.sizeInBytes = thunkInfo.SizeInBytes;
+    retInfo.userData = thunkInfo.UserData;
+    if (block_info != nullptr) {
+      // The only time host and agent ptr may be different is when the memory is lock memory (malloc
+      // memory pinned for GPU access).  In this case there can not be any suballocation so
+      // block_info is redundant and unused.  Host address is returned since host address is used to
+      // manipulate lock memory.  This protects future use of block_info with lock memory.
+      block_info->base = retInfo.hostBaseAddress;
+      block_info->length = retInfo.sizeInBytes;
+    }
+    if (retInfo.type == HSA_EXT_POINTER_TYPE_HSA) {
+      auto fragment = allocation_map_.upper_bound(ptr);
+      if (fragment != allocation_map_.begin()) {
+        fragment--;
+        if ((fragment->first <= ptr) &&
+            (ptr < reinterpret_cast<const uint8_t*>(fragment->first) + fragment->second.size)) {
+          // agent and host address must match here.  Only lock memory is allowed to have differing
+          // addresses but lock memory has type HSA_EXT_POINTER_TYPE_LOCKED and cannot be
+          // suballocated.
+          retInfo.agentBaseAddress = const_cast<void*>(fragment->first);
+          retInfo.hostBaseAddress = retInfo.agentBaseAddress;
+          retInfo.sizeInBytes = fragment->second.size;
+          retInfo.userData = fragment->second.user_ptr;
+        }
+      }
+    }
+  }  // end lock scope
 
-  static_assert((int)HSA_POINTER_UNKNOWN == (int)HSA_EXT_POINTER_TYPE_UNKNOWN,
-                "Thunk pointer info mismatch");
-  static_assert((int)HSA_POINTER_ALLOCATED == (int)HSA_EXT_POINTER_TYPE_HSA,
-                "Thunk pointer info mismatch");
-  static_assert((int)HSA_POINTER_REGISTERED_USER == (int)HSA_EXT_POINTER_TYPE_LOCKED,
-                "Thunk pointer info mismatch");
-  static_assert((int)HSA_POINTER_REGISTERED_GRAPHICS == (int)HSA_EXT_POINTER_TYPE_GRAPHICS,
-                "Thunk pointer info mismatch");
+  retInfo.size = Min(info->size, sizeof(hsa_amd_pointer_info_t));
 
-  info->size = Min(info->size, sizeof(struct hsa_amd_pointer_info_v1_s));
-  info->type = (hsa_amd_pointer_type_t)thunkInfo.Type;
-  info->agentBaseAddress = (void*)thunkInfo.GPUAddress;
-  info->hostBaseAddress = thunkInfo.CPUAddress;
-  info->sizeInBytes = thunkInfo.SizeInBytes;
-  info->userData = thunkInfo.UserData;
+  // Temp: workaround thunk bug, IPC memory has garbage in Node.
+  // retInfo.agentOwner = agents_by_node_[thunkInfo.Node][0]->public_handle();
+  auto it = agents_by_node_.find(thunkInfo.Node);
+  if (it != agents_by_node_.end())
+    retInfo.agentOwner = agents_by_node_[thunkInfo.Node][0]->public_handle();
+  else
+    retInfo.agentOwner.handle = 0;
+
+  memcpy(info, &retInfo, retInfo.size);
 
   if (returnListData) {
     uint32_t count = 0;
-    for (int i = 0; i < thunkInfo.NMappedNodes; i++) {
+    for (HSAuint32 i = 0; i < thunkInfo.NMappedNodes; i++) {
       assert(mappedNodes[i] < agents_by_node_.size() &&
              "PointerInfo: Invalid node ID returned from thunk.");
       count += agents_by_node_[mappedNodes[i]].size();
     }
 
-    *accessible = (hsa_agent_t*)alloc(sizeof(hsa_agent_t) * count);
+    AMD::callback_t<decltype(alloc)> Alloc(alloc);
+    *accessible = (hsa_agent_t*)Alloc(sizeof(hsa_agent_t) * count);
     if ((*accessible) == nullptr) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
     *num_agents_accessible = count;
 
     uint32_t index = 0;
-    for (int i = 0; i < thunkInfo.NMappedNodes; i++) {
+    for (HSAuint32 i = 0; i < thunkInfo.NMappedNodes; i++) {
       auto& list = agents_by_node_[mappedNodes[i]];
-      for (int j = 0; j < list.size(); j++) {
-        (*accessible)[index] = list[j]->public_handle();
+      for (auto agent : list) {
+        (*accessible)[index] = agent->public_handle();
         index++;
       }
     }
@@ -710,19 +787,50 @@ hsa_status_t Runtime::PtrInfo(void* ptr, hsa_amd_pointer_info_t* info, void* (*a
 }
 
 hsa_status_t Runtime::SetPtrInfoData(void* ptr, void* userptr) {
+  {  // Use allocation map if possible to handle fragments.
+    ScopedAcquire<KernelMutex> lock(&memory_lock_);
+    const auto& it = allocation_map_.find(ptr);
+    if (it != allocation_map_.end()) {
+      it->second.user_ptr = userptr;
+      return HSA_STATUS_SUCCESS;
+    }
+  }
+  // Cover entries not in the allocation map (graphics, lock,...)
   if (hsaKmtSetMemoryUserData(ptr, userptr) == HSAKMT_STATUS_SUCCESS)
     return HSA_STATUS_SUCCESS;
-  else
-    return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+  return HSA_STATUS_ERROR_INVALID_ARGUMENT;
 }
 
 hsa_status_t Runtime::IPCCreate(void* ptr, size_t len, hsa_amd_ipc_memory_t* handle) {
   static_assert(sizeof(hsa_amd_ipc_memory_t) == sizeof(HsaSharedMemoryHandle),
                 "Thunk IPC mismatch.");
-  if (hsaKmtShareMemory(ptr, len, (HsaSharedMemoryHandle*)handle) == HSAKMT_STATUS_SUCCESS)
-    return HSA_STATUS_SUCCESS;
-  else
+  // Reject sharing allocations larger than ~8TB due to thunk limitations.
+  if (len > 0x7FFFFFFF000ull) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+
+  // Check for fragment sharing.
+  PtrInfoBlockData block;
+  hsa_amd_pointer_info_t info;
+  info.size = sizeof(info);
+  if (PtrInfo(ptr, &info, nullptr, nullptr, nullptr, &block) != HSA_STATUS_SUCCESS)
     return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+  if ((block.base != ptr) || (block.length != len)) {
+    if (!IsMultipleOf(block.base, 2 * 1024 * 1024)) {
+      assert(false && "Fragment's block not aligned to 2MB!");
+      return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+    }
+    if (hsaKmtShareMemory(block.base, block.length, reinterpret_cast<HsaSharedMemoryHandle*>(
+                                                        handle)) != HSAKMT_STATUS_SUCCESS)
+      return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+    uint32_t offset =
+        (reinterpret_cast<uint8_t*>(ptr) - reinterpret_cast<uint8_t*>(block.base)) / 4096;
+    // Holds size in (4K?) pages in thunk handle: Mark as a fragment and denote offset.
+    handle->handle[6] |= 0x80000000 | offset;
+  } else {
+    if (hsaKmtShareMemory(ptr, len, reinterpret_cast<HsaSharedMemoryHandle*>(handle)) !=
+        HSAKMT_STATUS_SUCCESS)
+      return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+  }
+  return HSA_STATUS_SUCCESS;
 }
 
 hsa_status_t Runtime::IPCAttach(const hsa_amd_ipc_memory_t* handle, size_t len, uint32_t num_agents,
@@ -731,14 +839,36 @@ hsa_status_t Runtime::IPCAttach(const hsa_amd_ipc_memory_t* handle, size_t len, 
   void* importAddress;
   HSAuint64 importSize;
   HSAuint64 altAddress;
+
+  hsa_amd_ipc_memory_t importHandle;
+  importHandle = *handle;
+
+  // Extract fragment info
+  bool isFragment = false;
+  uint32_t fragOffset = 0;
+  auto fixFragment = [&]() {
+    if (!isFragment) return;
+    importAddress = reinterpret_cast<uint8_t*>(importAddress) + fragOffset;
+    len = Min(len, importSize - fragOffset);
+    ScopedAcquire<KernelMutex> lock(&memory_lock_);
+    allocation_map_[importAddress] = AllocationRegion(nullptr, len);
+  };
+
+  if ((importHandle.handle[6] & 0x80000000) != 0) {
+    isFragment = true;
+    fragOffset = (importHandle.handle[6] & 0x1FF) * 4096;
+    importHandle.handle[6] &= ~(0x80000000 | 0x1FF);
+  }
+
   if (num_agents == 0) {
-    if (hsaKmtRegisterSharedHandle(reinterpret_cast<const HsaSharedMemoryHandle*>(handle),
+    if (hsaKmtRegisterSharedHandle(reinterpret_cast<const HsaSharedMemoryHandle*>(&importHandle),
                                    &importAddress, &importSize) != HSAKMT_STATUS_SUCCESS)
       return HSA_STATUS_ERROR_INVALID_ARGUMENT;
     if (hsaKmtMapMemoryToGPU(importAddress, importSize, &altAddress) != HSAKMT_STATUS_SUCCESS) {
       hsaKmtDeregisterMemory(importAddress);
       return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
     }
+    fixFragment();
     *mapped_ptr = importAddress;
     return HSA_STATUS_SUCCESS;
   }
@@ -754,12 +884,12 @@ hsa_status_t Runtime::IPCAttach(const hsa_amd_ipc_memory_t* handle, size_t len, 
     if (num_agents > tinyArraySize) delete[] nodes;
   });
 
-  for (int i = 0; i < num_agents; i++)
+  for (uint32_t i = 0; i < num_agents; i++)
     agents[i]->GetInfo((hsa_agent_info_t)HSA_AMD_AGENT_INFO_DRIVER_NODE_ID, &nodes[i]);
 
-  if (hsaKmtRegisterSharedHandleToNodes(reinterpret_cast<const HsaSharedMemoryHandle*>(handle),
-                                        &importAddress, &importSize, num_agents,
-                                        nodes) != HSAKMT_STATUS_SUCCESS)
+  if (hsaKmtRegisterSharedHandleToNodes(
+          reinterpret_cast<const HsaSharedMemoryHandle*>(&importHandle), &importAddress,
+          &importSize, num_agents, nodes) != HSAKMT_STATUS_SUCCESS)
     return HSA_STATUS_ERROR_INVALID_ARGUMENT;
 
   HsaMemMapFlags map_flags;
@@ -775,11 +905,28 @@ hsa_status_t Runtime::IPCAttach(const hsa_amd_ipc_memory_t* handle, size_t len, 
     }
   }
 
+  fixFragment();
   *mapped_ptr = importAddress;
   return HSA_STATUS_SUCCESS;
 }
 
 hsa_status_t Runtime::IPCDetach(void* ptr) {
+  {  // Handle imported fragments.
+    ScopedAcquire<KernelMutex> lock(&memory_lock_);
+    const auto& it = allocation_map_.find(ptr);
+    if (it != allocation_map_.end()) {
+      if (it->second.region != nullptr) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+      allocation_map_.erase(it);
+      lock.Release();  // Can't hold memory lock when using pointer info.
+
+      PtrInfoBlockData block;
+      hsa_amd_pointer_info_t info;
+      info.size = sizeof(info);
+      if (PtrInfo(ptr, &info, nullptr, nullptr, nullptr, &block) != HSA_STATUS_SUCCESS)
+        return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+      ptr = block.base;
+    }
+  }
   if (hsaKmtUnmapMemoryToGPU(ptr) != HSAKMT_STATUS_SUCCESS)
     return HSA_STATUS_ERROR_INVALID_ARGUMENT;
   if (hsaKmtDeregisterMemory(ptr) != HSAKMT_STATUS_SUCCESS)
@@ -896,48 +1043,142 @@ bool Runtime::VMFaultHandler(hsa_signal_value_t val, void* arg) {
     return false;
   }
 
-  if (runtime_singleton_->flag().enable_vm_fault_message()) {
-    HsaEvent* vm_fault_event = vm_fault_signal->EopEvent();
+  HsaEvent* vm_fault_event = vm_fault_signal->EopEvent();
 
-    const HsaMemoryAccessFault& fault =
-        vm_fault_event->EventData.EventData.MemoryAccessFault;
+  HsaMemoryAccessFault& fault =
+      vm_fault_event->EventData.EventData.MemoryAccessFault;
 
-    std::string reason = "";
+  hsa_status_t custom_handler_status = HSA_STATUS_ERROR;
+  // If custom handler is registered, pack the fault info and call the handler
+  if (runtime_singleton_->GetCustomSystemEventHandler()) {
+    hsa_amd_gpu_memory_fault_info_t fault_info;
+
+    // Find the faulty agent
+    auto it = runtime_singleton_->agents_by_node_.find(fault.NodeId);
+    assert(it != runtime_singleton_->agents_by_node_.end() && "Can't find faulty agent.");
+    Agent* faulty_agent = it->second.front();
+    fault_info.agent = Agent::Convert(faulty_agent);
+
+    fault_info.virtual_address = fault.VirtualAddress;
+    fault_info.fault_reason_mask = 0x00000000;
     if (fault.Failure.NotPresent == 1) {
-      reason += "Page not present or supervisor privilege";
-    } else if (fault.Failure.ReadOnly == 1) {
-      reason += "Write access to a read-only page";
-    } else if (fault.Failure.NoExecute == 1) {
-      reason += "Execute access to a page marked NX";
-    } else if (fault.Failure.GpuAccess == 1) {
-      reason += "Host access only";
-    } else if (fault.Failure.ECC == 1) {
-      reason += "ECC failure (if supported by HW)";
-    } else {
-      reason += "Unknown";
+      fault_info.fault_reason_mask = fault_info.fault_reason_mask | 0x00000001;
     }
-
-    fprintf(stderr,
-            "Memory access fault by GPU node-%u on address %p%s. Reason: %s.\n",
-            fault.NodeId, reinterpret_cast<const void*>(fault.VirtualAddress),
-            (fault.Failure.Imprecise == 1) ? "(may not be exact address)" : "",
-            reason.c_str());
-  } else {
-    assert(false && "GPU memory access fault.");
+    if (fault.Failure.ReadOnly == 1) {
+      fault_info.fault_reason_mask = fault_info.fault_reason_mask | 0x00000010;
+    }
+    if (fault.Failure.NoExecute == 1) {
+      fault_info.fault_reason_mask = fault_info.fault_reason_mask | 0x00000100;
+    }
+    if (fault.Failure.GpuAccess == 1) {
+      fault_info.fault_reason_mask = fault_info.fault_reason_mask | 0x00001000;
+    }
+    if (fault.Failure.ECC == 1) {
+      fault_info.fault_reason_mask = fault_info.fault_reason_mask | 0x00010000;
+    }
+    if (fault.Failure.Imprecise == 1) {
+      fault_info.fault_reason_mask = fault_info.fault_reason_mask | 0x00100000;
+    }
+    hsa_amd_event_t memory_fault_event;
+    memory_fault_event.event_type = GPU_MEMORY_FAULT_EVENT;
+    memory_fault_event.memory_fault = fault_info;
+    custom_handler_status = runtime_singleton_->GetCustomSystemEventHandler()(
+        &memory_fault_event, runtime_singleton_->GetCustomSystemEventData());
   }
 
-  std::abort();
+  // No custom VM fault handler registered or it failed.
+  if (custom_handler_status != HSA_STATUS_SUCCESS) {
+    if (runtime_singleton_->flag().enable_vm_fault_message()) {
+      std::string reason = "";
+      if (fault.Failure.NotPresent == 1) {
+        reason += "Page not present or supervisor privilege";
+      } else if (fault.Failure.ReadOnly == 1) {
+        reason += "Write access to a read-only page";
+      } else if (fault.Failure.NoExecute == 1) {
+        reason += "Execute access to a page marked NX";
+      } else if (fault.Failure.GpuAccess == 1) {
+        reason += "Host access only";
+      } else if (fault.Failure.ECC == 1) {
+        reason += "ECC failure (if supported by HW)";
+      } else {
+        reason += "Unknown";
+      }
 
+      core::Agent* faultingAgent = runtime_singleton_->agents_by_node_[fault.NodeId][0];
+
+      fprintf(
+          stderr,
+          "Memory access fault by GPU node-%u (Agent handle: %p) on address %p%s. Reason: %s.\n",
+          fault.NodeId, reinterpret_cast<void*>(faultingAgent->public_handle().handle),
+          reinterpret_cast<const void*>(fault.VirtualAddress),
+          (fault.Failure.Imprecise == 1) ? "(may not be exact address)" : "", reason.c_str());
+
+#ifndef NDEBUG
+      runtime_singleton_->memory_lock_.Acquire();
+      auto it = runtime_singleton_->allocation_map_.upper_bound(
+          reinterpret_cast<void*>(fault.VirtualAddress));
+      for (int i = 0; i < 2; i++) {
+        if (it != runtime_singleton_->allocation_map_.begin()) it--;
+      }
+      fprintf(stderr, "Nearby memory map:\n");
+      auto start = it;
+      for (int i = 0; i < 3; i++) {
+        if (it == runtime_singleton_->allocation_map_.end()) break;
+        std::string kind = "Non-HSA";
+        if (it->second.region != nullptr) {
+          const amd::MemoryRegion* region =
+              static_cast<const amd::MemoryRegion*>(it->second.region);
+          if (region->IsSystem())
+            kind = "System";
+          else if (region->IsLocalMemory())
+            kind = "VRAM";
+          else if (region->IsScratch())
+            kind = "Scratch";
+          else if (region->IsLDS())
+            kind = "LDS";
+        }
+        fprintf(stderr, "%p, 0x%lx, %s\n", it->first, it->second.size, kind.c_str());
+        it++;
+      }
+      fprintf(stderr, "\n");
+      it = start;
+      runtime_singleton_->memory_lock_.Release();
+      hsa_amd_pointer_info_t info;
+      PtrInfoBlockData block;
+      uint32_t count;
+      hsa_agent_t* canAccess;
+      info.size = sizeof(info);
+      for (int i = 0; i < 3; i++) {
+        if (it == runtime_singleton_->allocation_map_.end()) break;
+        runtime_singleton_->PtrInfo(const_cast<void*>(it->first), &info, malloc, &count, &canAccess,
+                                    &block);
+        fprintf(stderr,
+                "PtrInfo:\n\tAddress: %p-%p/%p-%p\n\tSize: 0x%lx\n\tType: %u\n\tOwner: %p\n",
+                info.agentBaseAddress, (char*)info.agentBaseAddress + info.sizeInBytes,
+                info.hostBaseAddress, (char*)info.hostBaseAddress + info.sizeInBytes,
+                info.sizeInBytes, info.type, reinterpret_cast<void*>(info.agentOwner.handle));
+        fprintf(stderr, "\tCanAccess: %u\n", count);
+        for (int t = 0; t < count; t++)
+          fprintf(stderr, "\t\t%p\n", reinterpret_cast<void*>(canAccess[t].handle));
+        fprintf(stderr, "\tIn block: %p, 0x%lx\n", block.base, block.length);
+        free(canAccess);
+        it++;
+      }
+#endif  //! NDEBUG
+    }
+    assert(false && "GPU memory access fault.");
+    std::abort();
+  }
   // No need to keep the signal because we are done.
   return false;
 }
 
 Runtime::Runtime()
     : blit_agent_(NULL),
-      queue_count_(0),
       sys_clock_freq_(0),
-      vm_fault_event_(NULL),
-      vm_fault_signal_(NULL),
+      vm_fault_event_(nullptr),
+      vm_fault_signal_(nullptr),
+      system_event_handler_user_data_(nullptr),
       ref_count_(0) {
   start_svm_address_ = 0;
 #if defined(HSA_LARGE_MODEL)
@@ -983,10 +1224,17 @@ void Runtime::Unload() {
   amd::hsa::loader::Loader::Destroy(loader_);
   loader_ = nullptr;
 
+  std::for_each(gpu_agents_.begin(), gpu_agents_.end(), DeleteObject());
+  gpu_agents_.clear();
+
   async_events_control_.Shutdown();
 
-  delete vm_fault_signal_;
+  if (vm_fault_signal_ != nullptr) {
+    vm_fault_signal_->DestroySignal();
+    vm_fault_signal_ = nullptr;
+  }
   core::InterruptSignal::DestroyEvent(vm_fault_event_);
+  vm_fault_event_ = nullptr;
 
   DestroyAgents();
 
@@ -1011,9 +1259,13 @@ void Runtime::LoadExtensions() {
 
   // Update Hsa Api Table with handle of Image extension Apis
   extensions_.LoadFinalizer(kFinalizerLib[os_index(os::current_os)]);
+  hsa_api_table_.LinkExts(&extensions_.finalizer_api,
+                          core::HsaApiTable::HSA_EXT_FINALIZER_API_TABLE_ID);
 
   // Update Hsa Api Table with handle of Finalizer extension Apis
   extensions_.LoadImage(kImageLib[os_index(os::current_os)]);
+  hsa_api_table_.LinkExts(&extensions_.image_api,
+                          core::HsaApiTable::HSA_EXT_IMAGE_API_TABLE_ID);
 }
 
 void Runtime::UnloadExtensions() { extensions_.Unload(); }
@@ -1074,19 +1326,13 @@ void Runtime::LoadTools() {
   typedef Agent* (*tool_wrap_t)(Agent*);
   typedef void (*tool_add_t)(Runtime*);
 
-  // Link HSA Extensions for Finalizer and Images for Api interception
-  hsa_api_table_.LinkExts(&extensions_.finalizer_api,
-                          core::HsaApiTable::HSA_EXT_FINALIZER_API_TABLE_ID);
-  hsa_api_table_.LinkExts(&extensions_.image_api,
-                          core::HsaApiTable::HSA_EXT_IMAGE_API_TABLE_ID);
-
   // Load tool libs
   std::string tool_names = flag_.tools_lib_names();
   if (tool_names != "") {
     std::vector<std::string> names = parse_tool_names(tool_names);
     std::vector<const char*> failed;
-    for (int i = 0; i < names.size(); i++) {
-      os::LibHandle tool = os::LoadLib(names[i]);
+    for (auto& name : names) {
+      os::LibHandle tool = os::LoadLib(name);
 
       if (tool != NULL) {
         tool_libs_.push_back(tool);
@@ -1097,7 +1343,7 @@ void Runtime::LoadTools() {
           if (!ld(&hsa_api_table_.hsa_api,
                   hsa_api_table_.hsa_api.version.major_id,
                   failed.size(), &failed[0])) {
-            failed.push_back(names[i].c_str());
+            failed.push_back(name.c_str());
             os::CloseLib(tool);
             continue;
           }
@@ -1125,6 +1371,10 @@ void Runtime::LoadTools() {
         add = (tool_add_t)os::GetExportAddress(tool, "AddAgent");
         if (add) add(this);
       }
+      else {
+        if (flag().report_tool_load_failures())
+          fprintf(stderr, "Tool lib \"%s\" failed to load.\n", name.c_str());
+      }
     }
   }
 }
@@ -1145,7 +1395,7 @@ void Runtime::CloseTools() {
   // Due to valgrind bug, runtime cannot dlclose extensions see:
   // http://valgrind.org/docs/manual/faq.html#faq.unhelpful
   if (!flag_.running_valgrind()) {
-    for (int i = 0; i < tool_libs_.size(); i++) os::CloseLib(tool_libs_[i]);
+    for (auto& lib : tool_libs_) os::CloseLib(lib);
   }
   tool_libs_.clear();
 }
@@ -1196,6 +1446,17 @@ void Runtime::AsyncEvents::Clear() {
   value_.clear();
   handler_.clear();
   arg_.clear();
+}
+
+hsa_status_t Runtime::SetCustomSystemEventHandler(hsa_amd_system_event_callback_t callback,
+                                                  void* data) {
+  if (system_event_handler_) {
+    return HSA_STATUS_ERROR;
+  } else {
+    system_event_handler_ = callback;
+    system_event_handler_user_data_ = data;
+    return HSA_STATUS_SUCCESS;
+  }
 }
 
 }  // namespace core

@@ -53,11 +53,13 @@ namespace amd {
 /// @brief Encapsulates HW Aql Command Processor functionality. It
 /// provide the interface for things such as Doorbell register, read,
 /// write pointers and a buffer.
-class AqlQueue : public core::Queue, public core::Signal {
+class AqlQueue : public core::Queue, private core::LocalSignal, public core::DoorbellSignal {
  public:
   static __forceinline bool IsType(core::Signal* signal) {
     return signal->IsType(&rtti_id_);
   }
+
+  static __forceinline bool IsType(core::Queue* queue) { return queue->IsType(&rtti_id_); }
 
   // Acquires/releases queue resources and requests HW schedule/deschedule.
   AqlQueue(GpuAgent* agent, size_t req_size_pkts, HSAuint32 node_id,
@@ -66,11 +68,11 @@ class AqlQueue : public core::Queue, public core::Signal {
 
   ~AqlQueue();
 
-  /// @brief Indicates if queue is valid or not
-  bool IsValid() const { return valid_; }
-
   /// @brief Queue interfaces
   hsa_status_t Inactivate() override;
+
+  /// @brief Change the scheduling priority of the queue
+  hsa_status_t SetPriority(HSA_QUEUE_PRIORITY priority) override;
 
   /// @brief Atomically reads the Read index of with Acquire semantics
   ///
@@ -184,166 +186,14 @@ class AqlQueue : public core::Queue, public core::Signal {
   // @brief Submits a block of PM4 and waits until it has been executed.
   void ExecutePM4(uint32_t* cmd_data, size_t cmd_size_b) override;
 
-  /// @brief This operation is illegal
-  hsa_signal_value_t LoadRelaxed() override {
-    assert(false);
-    return 0;
-  }
-
-  /// @brief This operation is illegal
-  hsa_signal_value_t LoadAcquire() override {
-    assert(false);
-    return 0;
-  }
-
   /// @brief Update signal value using Relaxed semantics
   void StoreRelaxed(hsa_signal_value_t value) override;
 
   /// @brief Update signal value using Release semantics
   void StoreRelease(hsa_signal_value_t value) override;
 
-  /// @brief This operation is illegal
-  hsa_signal_value_t WaitRelaxed(hsa_signal_condition_t condition, hsa_signal_value_t compare_value,
-                                 uint64_t timeout, hsa_wait_state_t wait_hint) override {
-    assert(false);
-    return 0;
-  }
-
-  /// @brief This operation is illegal
-  hsa_signal_value_t WaitAcquire(hsa_signal_condition_t condition, hsa_signal_value_t compare_value,
-                                 uint64_t timeout, hsa_wait_state_t wait_hint) override {
-    assert(false);
-    return 0;
-  }
-
-  /// @brief This operation is illegal
-  void AndRelaxed(hsa_signal_value_t value) override { assert(false); }
-
-  /// @brief This operation is illegal
-  void AndAcquire(hsa_signal_value_t value) override { assert(false); }
-
-  /// @brief This operation is illegal
-  void AndRelease(hsa_signal_value_t value) override { assert(false); }
-
-  /// @brief This operation is illegal
-  void AndAcqRel(hsa_signal_value_t value) override { assert(false); }
-
-  /// @brief This operation is illegal
-  void OrRelaxed(hsa_signal_value_t value) override { assert(false); }
-
-  /// @brief This operation is illegal
-  void OrAcquire(hsa_signal_value_t value) override { assert(false); }
-
-  /// @brief This operation is illegal
-  void OrRelease(hsa_signal_value_t value) override { assert(false); }
-
-  /// @brief This operation is illegal
-  void OrAcqRel(hsa_signal_value_t value) override { assert(false); }
-
-  /// @brief This operation is illegal
-  void XorRelaxed(hsa_signal_value_t value) override { assert(false); }
-
-  /// @brief This operation is illegal
-  void XorAcquire(hsa_signal_value_t value) override { assert(false); }
-
-  /// @brief This operation is illegal
-  void XorRelease(hsa_signal_value_t value) override { assert(false); }
-
-  /// @brief This operation is illegal
-  void XorAcqRel(hsa_signal_value_t value) override { assert(false); }
-
-  /// @brief This operation is illegal
-  void AddRelaxed(hsa_signal_value_t value) override { assert(false); }
-
-  /// @brief This operation is illegal
-  void AddAcquire(hsa_signal_value_t value) override { assert(false); }
-
-  /// @brief This operation is illegal
-  void AddRelease(hsa_signal_value_t value) override { assert(false); }
-
-  /// @brief This operation is illegal
-  void AddAcqRel(hsa_signal_value_t value) override { assert(false); }
-
-  /// @brief This operation is illegal
-  void SubRelaxed(hsa_signal_value_t value) override { assert(false); }
-
-  /// @brief This operation is illegal
-  void SubAcquire(hsa_signal_value_t value) override { assert(false); }
-
-  /// @brief This operation is illegal
-  void SubRelease(hsa_signal_value_t value) override { assert(false); }
-
-  /// @brief This operation is illegal
-  void SubAcqRel(hsa_signal_value_t value) override { assert(false); }
-
-  /// @brief This operation is illegal
-  hsa_signal_value_t ExchRelaxed(hsa_signal_value_t value) override {
-    assert(false);
-    return 0;
-  }
-
-  /// @brief This operation is illegal
-  hsa_signal_value_t ExchAcquire(hsa_signal_value_t value) override {
-    assert(false);
-    return 0;
-  }
-
-  /// @brief This operation is illegal
-  hsa_signal_value_t ExchRelease(hsa_signal_value_t value) override {
-    assert(false);
-    return 0;
-  }
-
-  /// @brief This operation is illegal
-  hsa_signal_value_t ExchAcqRel(hsa_signal_value_t value) override {
-    assert(false);
-    return 0;
-  }
-
-  /// @brief This operation is illegal
-  hsa_signal_value_t CasRelaxed(hsa_signal_value_t expected, hsa_signal_value_t value) override {
-    assert(false);
-    return 0;
-  }
-
-  /// @brief This operation is illegal
-  hsa_signal_value_t CasAcquire(hsa_signal_value_t expected, hsa_signal_value_t value) override {
-    assert(false);
-    return 0;
-  }
-
-  /// @brief This operation is illegal
-  hsa_signal_value_t CasRelease(hsa_signal_value_t expected, hsa_signal_value_t value) override {
-    assert(false);
-    return 0;
-  }
-
-  /// @brief This operation is illegal
-  hsa_signal_value_t CasAcqRel(hsa_signal_value_t expected, hsa_signal_value_t value) override {
-    assert(false);
-    return 0;
-  }
-
-  /// @brief This operation is illegal
-  hsa_signal_value_t* ValueLocation() const override {
-    assert(false);
-    return NULL;
-  }
-
-  /// @brief This operation is illegal
-  HsaEvent* EopEvent() override {
-    assert(false);
-    return NULL;
-  }
-
-  // 64 byte-aligned allocation and release, for Queue::amd_queue_.
-  void* operator new(size_t size);
-  void* operator new(size_t size, void* ptr) { return ptr; }
-  void operator delete(void* ptr);
-  void operator delete(void*, void*) {}
-
  protected:
-  bool _IsA(rtti_t id) const override { return id == &rtti_id_; }
+  bool _IsA(Queue::rtti_t id) const override { return id == &rtti_id_; }
 
  private:
   uint32_t ComputeRingBufferMinPkts();
@@ -353,11 +203,19 @@ class AqlQueue : public core::Queue, public core::Signal {
   void AllocRegisteredRingBuffer(uint32_t queue_size_pkts);
   void FreeRegisteredRingBuffer();
 
-  static bool DynamicScratchHandler(hsa_signal_value_t error_code, void* arg);
+  /// @brief Abstracts the file handle use for double mapping queues.
+  void CloseRingBufferFD(const char* ring_buf_shm_path, int fd) const;
+  int CreateRingBufferFD(const char* ring_buf_shm_path, uint32_t ring_buf_phys_size_bytes) const;
 
   /// @brief Define the Scratch Buffer Descriptor and related parameters
   /// that enable kernel access scratch memory
   void InitScratchSRD();
+
+  /// @brief Halt the queue without destroying it or fencing memory.
+  void Suspend();
+
+  /// @brief Handler for hardware queue events.
+  static bool DynamicScratchHandler(hsa_signal_value_t error_code, void* arg);
 
   // AQL packet ring buffer
   void* ring_buf_;
@@ -369,11 +227,8 @@ class AqlQueue : public core::Queue, public core::Signal {
   // Id of the Queue used in communication with thunk
   HSA_QUEUEID queue_id_;
 
-  // Indicates is queue is valid
-  bool valid_;
-
-  // Indicates if queue is inactive
-  int32_t active_;
+  // Indicates if queue is active
+  std::atomic<bool> active_;
 
   // Cached value of HsaNodeProperties.HSA_CAPABILITY.DoorbellType
   int doorbell_type_;
@@ -386,7 +241,7 @@ class AqlQueue : public core::Queue, public core::Signal {
   // Handle of scratch memory descriptor
   ScratchInfo queue_scratch_;
 
-  core::HsaEventCallback errors_callback_;
+  AMD::callback_t<core::HsaEventCallback> errors_callback_;
 
   void* errors_data_;
 
@@ -398,11 +253,21 @@ class AqlQueue : public core::Queue, public core::Signal {
   uint32_t pm4_ib_size_b_;
   KernelMutex pm4_ib_mutex_;
 
+  // Error handler control variable.
+  std::atomic<uint32_t> dynamicScratchState;
+  enum { ERROR_HANDLER_DONE = 1, ERROR_HANDLER_TERMINATE = 2, ERROR_HANDLER_SCRATCH_RETRY = 4 };
+
+  // Queue currently suspended or scheduled
+  bool suspended_;
+
+  // Thunk dispatch and wavefront scheduling priority
+  HSA_QUEUE_PRIORITY priority_;
+
   // Shared event used for queue errors
   static HsaEvent* queue_event_;
 
   // Queue count - used to ref count queue_event_
-  static volatile uint32_t queue_count_;
+  static std::atomic<uint32_t> queue_count_;
 
   // Mutex for queue_event_ manipulation
   static KernelMutex queue_lock_;
@@ -412,5 +277,7 @@ class AqlQueue : public core::Queue, public core::Signal {
   // Forbid copying and moving of this object
   DISALLOW_COPY_AND_ASSIGN(AqlQueue);
 };
+
 }  // namespace amd
+
 #endif  // header guard

@@ -88,7 +88,8 @@ public:
 
   bool is_loaded;
   hsa_symbol_kind_t kind;
-  std::string name;
+  std::string module_name;
+  std::string symbol_name;
   hsa_symbol_linkage_t linkage;
   bool is_definition;
   uint64_t address;
@@ -101,18 +102,20 @@ public:
 protected:
   SymbolImpl(const bool &_is_loaded,
              const hsa_symbol_kind_t &_kind,
-             const std::string &_name,
+             const std::string &_module_name,
+             const std::string &_symbol_name,
              const hsa_symbol_linkage_t &_linkage,
              const bool &_is_definition,
              const uint64_t &_address = 0)
     : is_loaded(_is_loaded)
     , kind(_kind)
-    , name(_name)
+    , module_name(_module_name)
+    , symbol_name(_symbol_name)
     , linkage(_linkage)
     , is_definition(_is_definition)
     , address(_address) {}
 
-  virtual bool GetInfo(hsa_symbol_info32_t symbol_info, void *value) override;
+  virtual bool GetInfo(hsa_symbol_info32_t symbol_info, void *value);
 
 private:
   SymbolImpl(const SymbolImpl &s);
@@ -126,7 +129,8 @@ private:
 class KernelSymbol final: public SymbolImpl {
 public:
   KernelSymbol(const bool &_is_loaded,
-               const std::string &_name,
+               const std::string &_module_name,
+               const std::string &_symbol_name,
                const hsa_symbol_linkage_t &_linkage,
                const bool &_is_definition,
                const uint32_t &_kernarg_segment_size,
@@ -139,10 +143,12 @@ public:
                const uint64_t &_address = 0)
     : SymbolImpl(_is_loaded,
                  HSA_SYMBOL_KIND_KERNEL,
-                 _name,
+                 _module_name,
+                 _symbol_name,
                  _linkage,
                  _is_definition,
                  _address)
+    , full_name(_module_name.empty() ? _symbol_name : _module_name + "::" + _symbol_name)
     , kernarg_segment_size(_kernarg_segment_size)
     , kernarg_segment_alignment(_kernarg_segment_alignment)
     , group_segment_size(_group_segment_size)
@@ -155,6 +161,7 @@ public:
 
   bool GetInfo(hsa_symbol_info32_t symbol_info, void *value);
 
+  std::string full_name;
   uint32_t kernarg_segment_size;
   uint32_t kernarg_segment_alignment;
   uint32_t group_segment_size;
@@ -176,7 +183,8 @@ private:
 class VariableSymbol final: public SymbolImpl {
 public:
   VariableSymbol(const bool &_is_loaded,
-                 const std::string &_name,
+                 const std::string &_module_name,
+                 const std::string &_symbol_name,
                  const hsa_symbol_linkage_t &_linkage,
                  const bool &_is_definition,
                  const hsa_variable_allocation_t &_allocation,
@@ -188,7 +196,8 @@ public:
                  const uint64_t &_address = 0)
     : SymbolImpl(_is_loaded,
                  HSA_SYMBOL_KIND_VARIABLE,
-                 _name,
+                 _module_name,
+                 _symbol_name,
                  _linkage,
                  _is_definition,
                  _address)
@@ -268,6 +277,15 @@ public:
   void Print(std::ostream& out) override;
 
   void Destroy() override {}
+
+  hsa_agent_t getAgent() const override;
+  hsa_executable_t getExecutable() const override;
+  uint64_t getElfData() const override;
+  uint64_t getElfSize() const override;
+  uint64_t getStorageOffset() const override;
+  uint64_t getLoadBase() const override;
+  uint64_t getLoadSize() const override;
+  int64_t getDelta() const override;
 };
 
 class Segment : public LoadedSegment, public ExecutableObject {
@@ -423,6 +441,7 @@ public:
 
   hsa_status_t IterateLoadedCodeObjects(
     hsa_status_t (*callback)(
+      hsa_executable_t executable,
       hsa_loaded_code_object_t loaded_code_object,
       void *data),
     void *data) override;
@@ -525,6 +544,8 @@ public:
   hsa_executable_t FindExecutable(uint64_t device_address) override;
 
   uint64_t FindHostAddress(uint64_t device_address) override;
+
+  void PrintHelp(std::ostream& out) override;
 
   void EnableReadOnlyMode();
   void DisableReadOnlyMode();

@@ -183,6 +183,9 @@ namespace code {
       static Symbol* FromHandle(hsa_code_symbol_t handle);
       void setValue(uint64_t value) { elfsym->setValue(value); }
       void setSize(uint32_t size) { elfsym->setSize(size); }
+
+      std::string GetModuleName() const;
+      std::string GetSymbolName() const;
     };
 
     class KernelSymbol : public Symbol {
@@ -264,6 +267,7 @@ namespace code {
       const amd::elf::Section* HsaText() const { assert(hsatext); return hsatext; }
       amd::elf::SymbolTable* Symtab() { assert(img); return img->symtab(); }
       uint16_t Machine() const { return img->Machine(); }
+      uint32_t EFlags() const { return img->EFlags(); }
 
       AmdHsaCode(bool combineDataSegments = true);
       virtual ~AmdHsaCode();

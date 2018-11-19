@@ -31,7 +31,7 @@
 //    permission.
 //
 // THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIESd OF MERCHANTABILITY,
 // FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
 // THE CONTRIBUTORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR
 // OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
@@ -40,24 +40,86 @@
 //
 ////////////////////////////////////////////////////////////////////////////////
 
-module &m:1:0:$base:$large:$default;
+#ifndef HSA_RUNTIME_CORE_UTIL_LAZY_PTR_H_
+#define HSA_RUNTIME_CORE_UTIL_LAZY_PTR_H_
 
-decl prog function &abort()();
+#include <memory>
+#include <utility>
+#include <functional>
 
-prog kernel &__vector_copy_kernel(
-	kernarg_u64 %in,
-	kernarg_u64 %out)
-{
-@__vector_copy_kernel_entry:
-	// BB#0:                                // %entry
-	workitemabsid_u32	$s0, 0;
-	cvt_s64_s32	$d0, $s0;
-	shl_u64	$d0, $d0, 2;
-	ld_kernarg_align(8)_width(all)_u64	$d1, [%out];
-	add_u64	$d1, $d1, $d0;
-	ld_kernarg_align(8)_width(all)_u64	$d2, [%in];
-	add_u64	$d0, $d2, $d0;
-	ld_global_u32	$s0, [$d0];
-	st_global_u32	$s0, [$d1];
-	ret;
+#include "core/util/utils.h"
+
+/*
+ * Wrapper for a std::unique_ptr that initializes its object at first use.
+ */
+template <typename T> class lazy_ptr {
+ public:
+  lazy_ptr() {}
+
+  explicit lazy_ptr(std::function<T*()> Constructor) { Init(Constructor); }
+
+  void reset(std::function<T*()> Constructor = nullptr) {
+    obj.reset();
+    func = Constructor;
+  }
+
+  void reset(T* ptr) {
+    obj.reset(ptr);
+    func = nullptr;
+  }
+
+  bool operator==(T* rhs) const { return obj.get() == rhs; }
+  bool operator!=(T* rhs) const { return obj.get() != rhs; }
+
+  const std::unique_ptr<T>& operator->() const {
+    make(true);
+    return obj;
+  }
+
+  std::unique_ptr<T>& operator*() {
+    make(true);
+    return obj;
+  }
+
+  const std::unique_ptr<T>& operator*() const {
+    make(true);
+    return obj;
+  }
+
+  /*
+   * Ensures that the object is created or is being created.
+   * This is useful when early consruction of the object is required.
+   */
+  void touch() const { make(false); }
+
+ private:
+  mutable std::unique_ptr<T> obj;
+  mutable std::function<T*(void)> func;
+  mutable KernelMutex lock;
+
+  // Separated from make to improve inlining.
+  void make_body(bool block) const {
+    if (block) {
+      lock.Acquire();
+    } else if (!lock.Try()) {
+      return;
+    }
+    MAKE_SCOPE_GUARD([&]() { lock.Release(); });
+    if (obj != nullptr) return;
+    T* ptr = func();
+    std::atomic_thread_fence(std::memory_order_release);
+    obj.reset(ptr);
+    func = nullptr;
+  }
+
+  __forceinline void make(bool block) const {
+    std::atomic_thread_fence(std::memory_order_acquire);
+    if (obj == nullptr) {
+      make_body(block);
+    }
+  }
+
+  DISALLOW_COPY_AND_ASSIGN(lazy_ptr);
 };
+
+#endif  // HSA_RUNTIME_CORE_UTIL_LAZY_PTR_H_

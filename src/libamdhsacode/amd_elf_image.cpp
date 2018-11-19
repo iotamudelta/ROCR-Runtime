@@ -41,6 +41,7 @@
 ////////////////////////////////////////////////////////////////////////////////
 
 #include "amd_elf_image.hpp"
+#include "amd_hsa_code_util.hpp"
 #include <gelf.h>
 #include <errno.h>
 #include <cstring>
@@ -50,7 +51,6 @@
 #include <cassert>
 #include <cstdlib>
 #include <algorithm>
-#include "amd_hsa_code_util.hpp"
 #ifdef _WIN32
 #include <Windows.h>
 #define alignof __alignof
@@ -60,11 +60,32 @@
 #ifndef _WIN32
 #define _open open
 #define _close close
+#define _tempnam tempnam
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
+#if defined(USE_MEMFILE)
+
+#include "memfile.h"
+#define OpenTemp(f)           mem_open(NULL, 0, 0)
+#define CloseTemp(f)          mem_close(f)
+#define _read(f, b, l)        mem_read((f), (b), (l))
+#define _write(f, b, l)       mem_write((f), (b), (l))
+#define _lseek(f, l, w)       mem_lseek((f), (l), (w))
+#define _ftruncate(f, l)      mem_ftruncate((f), (size_t)(l))
+#define sendfile(o, i, p, s)  mem_sendfile((o), (i), (p), (s))
+
+#else // USE_MEMFILE
+
+#define OpenTemp(f) amd::hsa::OpenTempFile(f);
+#define CloseTemp(f) amd::hsa::CloseTempFile(f);
+
+#ifndef _WIN32
 #define _read read
 #define _write write
 #define _lseek lseek
 #define _ftruncate ftruncate
-#define _tempnam tempnam
 #ifdef __FreeBSD__
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -72,11 +93,11 @@
 #else
 #include <sys/sendfile.h>
 #endif
-#include <fcntl.h>
-#include <unistd.h>
 #else
 #define _ftruncate _chsize
-#endif
+#endif // !_WIN32
+
+#endif // !USE_MEMFILE
 
 #if !defined(BSD_LIBELF)
   #define elf_setshstrndx elfx_update_shstrndx
@@ -121,7 +142,7 @@ namespace amd {
 
     FileImage::~FileImage()
     {
-      if (d >= 0) { amd::hsa::CloseTempFile(d); }
+      if (d != -1) { CloseTemp(d); }
     }
 
     bool FileImage::error(const char* msg)
@@ -159,8 +180,8 @@ namespace amd {
 
     bool FileImage::create()
     {
-      d = amd::hsa::OpenTempFile("amdelf");
-      if (d < 0) { return error("Failed to open temporary file for elf image"); }
+      d = OpenTemp("amdelf");
+      if (d == -1) { return error("Failed to open temporary file for elf image"); }
       return true;
     }
 
@@ -692,6 +713,7 @@ namespace amd {
 
       uint16_t Machine() override { return ehdr.e_machine; }
       uint16_t Type() override { return ehdr.e_type; }
+      uint32_t EFlags() override{ return ehdr.e_flags; }
 
       GElfStringTable* shstrtab() override;
       GElfStringTable* strtab() override;

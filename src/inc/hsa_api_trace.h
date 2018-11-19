@@ -2,24 +2,24 @@
 //
 // The University of Illinois/NCSA
 // Open Source License (NCSA)
-// 
+//
 // Copyright (c) 2014-2015, Advanced Micro Devices, Inc. All rights reserved.
-// 
+//
 // Developed by:
-// 
+//
 //                 AMD Research and AMD HSA Software Development
-// 
+//
 //                 Advanced Micro Devices, Inc.
-// 
+//
 //                 www.amd.com
-// 
+//
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to
 // deal with the Software without restriction, including without limitation
 // the rights to use, copy, modify, merge, publish, distribute, sublicense,
 // and/or sell copies of the Software, and to permit persons to whom the
 // Software is furnished to do so, subject to the following conditions:
-// 
+//
 //  - Redistributions of source code must retain the above copyright notice,
 //    this list of conditions and the following disclaimers.
 //  - Redistributions in binary form must reproduce the above copyright
@@ -29,7 +29,7 @@
 //    nor the names of its contributors may be used to endorse or promote
 //    products derived from this Software without specific prior written
 //    permission.
-// 
+//
 // THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 // IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 // FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
@@ -64,6 +64,7 @@
 #define HSA_AMD_EXT_API_TABLE_MAJOR_VERSION       0x01
 #define HSA_FINALIZER_API_TABLE_MAJOR_VERSION     0x01
 #define HSA_IMAGE_API_TABLE_MAJOR_VERSION         0x01
+#define HSA_AQLPROFILE_API_TABLE_MAJOR_VERSION    0x01
 
 // Step Ids of the Api tables exported by Hsa Core Runtime
 #define HSA_API_TABLE_STEP_VERSION                0x00
@@ -71,13 +72,29 @@
 #define HSA_AMD_EXT_API_TABLE_STEP_VERSION        0x00
 #define HSA_FINALIZER_API_TABLE_STEP_VERSION      0x00
 #define HSA_IMAGE_API_TABLE_STEP_VERSION          0x00
+#define HSA_AQLPROFILE_API_TABLE_STEP_VERSION     0x00
 
 // Min function used to copy Api Tables
 static inline uint32_t Min(const uint32_t a, const uint32_t b) {
   return (a > b) ? b : a;
 }
 
+// Declarations of APIs intended for use only by tools.
+typedef void (*hsa_amd_queue_intercept_packet_writer)(const void* pkts, uint64_t pkt_count);
+typedef void (*hsa_amd_queue_intercept_handler)(const void* pkts, uint64_t pkt_count,
+                                                uint64_t user_pkt_index, void* data,
+                                                hsa_amd_queue_intercept_packet_writer writer);
+hsa_status_t hsa_amd_queue_intercept_register(hsa_queue_t* queue,
+                                              hsa_amd_queue_intercept_handler callback,
+                                              void* user_data);
+hsa_status_t hsa_amd_queue_intercept_create(
+    hsa_agent_t agent_handle, uint32_t size, hsa_queue_type32_t type,
+    void (*callback)(hsa_status_t status, hsa_queue_t* source, void* data), void* data,
+    uint32_t private_segment_size, uint32_t group_segment_size, hsa_queue_t** queue);
+
 // Structure of Version used to identify an instance of Api table
+// Must be the first member (offsetof == 0) of all API tables.
+// This is the root of the table passing ABI.
 struct ApiTableVersion {
   uint32_t major_id;
   uint32_t minor_id;
@@ -85,7 +102,7 @@ struct ApiTableVersion {
   uint32_t reserved;
 };
 
-// Table to export HSA Finalizer Extension Apis 
+// Table to export HSA Finalizer Extension Apis
 struct FinalizerExtTable {
   ApiTableVersion version;
 	decltype(hsa_ext_program_create)* hsa_ext_program_create_fn;
@@ -109,6 +126,9 @@ struct ImageExtTable {
 	decltype(hsa_ext_image_destroy)* hsa_ext_image_destroy_fn;
 	decltype(hsa_ext_sampler_create)* hsa_ext_sampler_create_fn;
 	decltype(hsa_ext_sampler_destroy)* hsa_ext_sampler_destroy_fn;
+  decltype(hsa_ext_image_get_capability_with_layout)* hsa_ext_image_get_capability_with_layout_fn;
+  decltype(hsa_ext_image_data_get_info_with_layout)* hsa_ext_image_data_get_info_with_layout_fn;
+  decltype(hsa_ext_image_create_with_layout)* hsa_ext_image_create_with_layout_fn;
 };
 
 // Table to export AMD Extension Apis
@@ -145,6 +165,13 @@ struct AmdExtTable {
   decltype(hsa_amd_ipc_memory_create)* hsa_amd_ipc_memory_create_fn;
   decltype(hsa_amd_ipc_memory_attach)* hsa_amd_ipc_memory_attach_fn;
   decltype(hsa_amd_ipc_memory_detach)* hsa_amd_ipc_memory_detach_fn;
+  decltype(hsa_amd_signal_create)* hsa_amd_signal_create_fn;
+  decltype(hsa_amd_ipc_signal_create)* hsa_amd_ipc_signal_create_fn;
+  decltype(hsa_amd_ipc_signal_attach)* hsa_amd_ipc_signal_attach_fn;
+  decltype(hsa_amd_register_system_event_handler)* hsa_amd_register_system_event_handler_fn;
+  decltype(hsa_amd_queue_intercept_create)* hsa_amd_queue_intercept_create_fn;
+  decltype(hsa_amd_queue_intercept_register)* hsa_amd_queue_intercept_register_fn;
+  decltype(hsa_amd_queue_set_priority)* hsa_amd_queue_set_priority_fn;
 };
 
 // Table to export HSA Core Runtime Apis
@@ -161,52 +188,22 @@ struct CoreApiTable {
   decltype(hsa_soft_queue_create)* hsa_soft_queue_create_fn;
   decltype(hsa_queue_destroy)* hsa_queue_destroy_fn;
   decltype(hsa_queue_inactivate)* hsa_queue_inactivate_fn;
-  union {
-    decltype(hsa_queue_load_read_index_scacquire)* hsa_queue_load_read_index_scacquire_fn;
-    decltype(hsa_queue_load_read_index_acquire)* hsa_queue_load_read_index_acquire_fn;
-  };
+  decltype(hsa_queue_load_read_index_scacquire)* hsa_queue_load_read_index_scacquire_fn;
   decltype(hsa_queue_load_read_index_relaxed)* hsa_queue_load_read_index_relaxed_fn;
-  union {
-    decltype(hsa_queue_load_write_index_scacquire)* hsa_queue_load_write_index_scacquire_fn;
-    decltype(hsa_queue_load_write_index_acquire)* hsa_queue_load_write_index_acquire_fn;
-  };
+  decltype(hsa_queue_load_write_index_scacquire)* hsa_queue_load_write_index_scacquire_fn;
   decltype(hsa_queue_load_write_index_relaxed)* hsa_queue_load_write_index_relaxed_fn;
   decltype(hsa_queue_store_write_index_relaxed)* hsa_queue_store_write_index_relaxed_fn;
-  union {
-    decltype(hsa_queue_store_write_index_screlease)* hsa_queue_store_write_index_screlease_fn;
-    decltype(hsa_queue_store_write_index_release)* hsa_queue_store_write_index_release_fn;
-  };
-  union {
-    decltype(hsa_queue_cas_write_index_scacq_screl)* hsa_queue_cas_write_index_scacq_screl_fn;
-    decltype(hsa_queue_cas_write_index_acq_rel)* hsa_queue_cas_write_index_acq_rel_fn;
-  };
-  union {
-    decltype(hsa_queue_cas_write_index_scacquire)* hsa_queue_cas_write_index_scacquire_fn;
-    decltype(hsa_queue_cas_write_index_acquire)* hsa_queue_cas_write_index_acquire_fn;
-  };
+  decltype(hsa_queue_store_write_index_screlease)* hsa_queue_store_write_index_screlease_fn;
+  decltype(hsa_queue_cas_write_index_scacq_screl)* hsa_queue_cas_write_index_scacq_screl_fn;
+  decltype(hsa_queue_cas_write_index_scacquire)* hsa_queue_cas_write_index_scacquire_fn;
   decltype(hsa_queue_cas_write_index_relaxed)* hsa_queue_cas_write_index_relaxed_fn;
-  union {
-    decltype(hsa_queue_cas_write_index_screlease)* hsa_queue_cas_write_index_screlease_fn;
-    decltype(hsa_queue_cas_write_index_release)* hsa_queue_cas_write_index_release_fn;
-  };
-  union {
-    decltype(hsa_queue_add_write_index_scacq_screl)* hsa_queue_add_write_index_scacq_screl_fn;
-    decltype(hsa_queue_add_write_index_acq_rel)* hsa_queue_add_write_index_acq_rel_fn;
-  };
-  union {
-    decltype(hsa_queue_add_write_index_scacquire)* hsa_queue_add_write_index_scacquire_fn;
-    decltype(hsa_queue_add_write_index_acquire)* hsa_queue_add_write_index_acquire_fn;
-  };
+  decltype(hsa_queue_cas_write_index_screlease)* hsa_queue_cas_write_index_screlease_fn;
+  decltype(hsa_queue_add_write_index_scacq_screl)* hsa_queue_add_write_index_scacq_screl_fn;
+  decltype(hsa_queue_add_write_index_scacquire)* hsa_queue_add_write_index_scacquire_fn;
   decltype(hsa_queue_add_write_index_relaxed)* hsa_queue_add_write_index_relaxed_fn;
-  union {
-    decltype(hsa_queue_add_write_index_screlease)* hsa_queue_add_write_index_screlease_fn;
-    decltype(hsa_queue_add_write_index_release)* hsa_queue_add_write_index_release_fn;
-  };
+  decltype(hsa_queue_add_write_index_screlease)* hsa_queue_add_write_index_screlease_fn;
   decltype(hsa_queue_store_read_index_relaxed)* hsa_queue_store_read_index_relaxed_fn;
-  union {
-    decltype(hsa_queue_store_read_index_screlease)* hsa_queue_store_read_index_screlease_fn;
-    decltype(hsa_queue_store_read_index_release)* hsa_queue_store_read_index_release_fn;
-  };
+  decltype(hsa_queue_store_read_index_screlease)* hsa_queue_store_read_index_screlease_fn;
   decltype(hsa_agent_iterate_regions)* hsa_agent_iterate_regions_fn;
   decltype(hsa_region_get_info)* hsa_region_get_info_fn;
   decltype(hsa_agent_get_exception_policies)* hsa_agent_get_exception_policies_fn;
@@ -220,111 +217,39 @@ struct CoreApiTable {
   decltype(hsa_signal_create)* hsa_signal_create_fn;
   decltype(hsa_signal_destroy)* hsa_signal_destroy_fn;
   decltype(hsa_signal_load_relaxed)* hsa_signal_load_relaxed_fn;
-  union {
-    decltype(hsa_signal_load_scacquire)* hsa_signal_load_scacquire_fn;
-    decltype(hsa_signal_load_acquire)* hsa_signal_load_acquire_fn;
-  };
+  decltype(hsa_signal_load_scacquire)* hsa_signal_load_scacquire_fn;
   decltype(hsa_signal_store_relaxed)* hsa_signal_store_relaxed_fn;
-  union {
-    decltype(hsa_signal_store_screlease)* hsa_signal_store_screlease_fn;
-    decltype(hsa_signal_store_release)* hsa_signal_store_release_fn;
-  };
+  decltype(hsa_signal_store_screlease)* hsa_signal_store_screlease_fn;
   decltype(hsa_signal_wait_relaxed)* hsa_signal_wait_relaxed_fn;
-  union {
-    decltype(hsa_signal_wait_scacquire)* hsa_signal_wait_scacquire_fn;
-    decltype(hsa_signal_wait_acquire)* hsa_signal_wait_acquire_fn;
-  };
+  decltype(hsa_signal_wait_scacquire)* hsa_signal_wait_scacquire_fn;
   decltype(hsa_signal_and_relaxed)* hsa_signal_and_relaxed_fn;
-  union {
-    decltype(hsa_signal_and_scacquire)* hsa_signal_and_scacquire_fn;
-    decltype(hsa_signal_and_acquire)* hsa_signal_and_acquire_fn;
-  };
-  union {
-    decltype(hsa_signal_and_screlease)* hsa_signal_and_screlease_fn;
-    decltype(hsa_signal_and_release)* hsa_signal_and_release_fn;
-  };
-  union {
-    decltype(hsa_signal_and_scacq_screl)* hsa_signal_and_scacq_screl_fn;
-    decltype(hsa_signal_and_acq_rel)* hsa_signal_and_acq_rel_fn;
-  };
+  decltype(hsa_signal_and_scacquire)* hsa_signal_and_scacquire_fn;
+  decltype(hsa_signal_and_screlease)* hsa_signal_and_screlease_fn;
+  decltype(hsa_signal_and_scacq_screl)* hsa_signal_and_scacq_screl_fn;
   decltype(hsa_signal_or_relaxed)* hsa_signal_or_relaxed_fn;
-  union {
-    decltype(hsa_signal_or_scacquire)* hsa_signal_or_scacquire_fn;
-    decltype(hsa_signal_or_acquire)* hsa_signal_or_acquire_fn;
-  };
-  union {
-    decltype(hsa_signal_or_screlease)* hsa_signal_or_screlease_fn;
-    decltype(hsa_signal_or_release)* hsa_signal_or_release_fn;
-  };
-  union {
-    decltype(hsa_signal_or_scacq_screl)* hsa_signal_or_scacq_screl_fn;
-    decltype(hsa_signal_or_acq_rel)* hsa_signal_or_acq_rel_fn;
-  };
+  decltype(hsa_signal_or_scacquire)* hsa_signal_or_scacquire_fn;
+  decltype(hsa_signal_or_screlease)* hsa_signal_or_screlease_fn;
+  decltype(hsa_signal_or_scacq_screl)* hsa_signal_or_scacq_screl_fn;
   decltype(hsa_signal_xor_relaxed)* hsa_signal_xor_relaxed_fn;
-  union {
-    decltype(hsa_signal_xor_scacquire)* hsa_signal_xor_scacquire_fn;
-    decltype(hsa_signal_xor_acquire)* hsa_signal_xor_acquire_fn;
-  };
-  union {
-    decltype(hsa_signal_xor_screlease)* hsa_signal_xor_screlease_fn;
-    decltype(hsa_signal_xor_release)* hsa_signal_xor_release_fn;
-  };
-  union {
-    decltype(hsa_signal_xor_scacq_screl)* hsa_signal_xor_scacq_screl_fn;
-    decltype(hsa_signal_xor_acq_rel)* hsa_signal_xor_acq_rel_fn;
-  };
+  decltype(hsa_signal_xor_scacquire)* hsa_signal_xor_scacquire_fn;
+  decltype(hsa_signal_xor_screlease)* hsa_signal_xor_screlease_fn;
+  decltype(hsa_signal_xor_scacq_screl)* hsa_signal_xor_scacq_screl_fn;
   decltype(hsa_signal_exchange_relaxed)* hsa_signal_exchange_relaxed_fn;
-  union {
-    decltype(hsa_signal_exchange_scacquire)* hsa_signal_exchange_scacquire_fn;
-    decltype(hsa_signal_exchange_acquire)* hsa_signal_exchange_acquire_fn;
-  };
-  union {
-    decltype(hsa_signal_exchange_screlease)* hsa_signal_exchange_screlease_fn;
-    decltype(hsa_signal_exchange_release)* hsa_signal_exchange_release_fn;
-  };
-  union {
-    decltype(hsa_signal_exchange_scacq_screl)* hsa_signal_exchange_scacq_screl_fn;
-    decltype(hsa_signal_exchange_acq_rel)* hsa_signal_exchange_acq_rel_fn;
-  };
+  decltype(hsa_signal_exchange_scacquire)* hsa_signal_exchange_scacquire_fn;
+  decltype(hsa_signal_exchange_screlease)* hsa_signal_exchange_screlease_fn;
+  decltype(hsa_signal_exchange_scacq_screl)* hsa_signal_exchange_scacq_screl_fn;
   decltype(hsa_signal_add_relaxed)* hsa_signal_add_relaxed_fn;
-  union {
-    decltype(hsa_signal_add_scacquire)* hsa_signal_add_scacquire_fn;
-    decltype(hsa_signal_add_acquire)* hsa_signal_add_acquire_fn;
-  };
-  union {
-    decltype(hsa_signal_add_screlease)* hsa_signal_add_screlease_fn;
-    decltype(hsa_signal_add_release)* hsa_signal_add_release_fn;
-  };
-  union {
-    decltype(hsa_signal_add_scacq_screl)* hsa_signal_add_scacq_screl_fn;
-    decltype(hsa_signal_add_acq_rel)* hsa_signal_add_acq_rel_fn;
-  };
+  decltype(hsa_signal_add_scacquire)* hsa_signal_add_scacquire_fn;
+  decltype(hsa_signal_add_screlease)* hsa_signal_add_screlease_fn;
+  decltype(hsa_signal_add_scacq_screl)* hsa_signal_add_scacq_screl_fn;
   decltype(hsa_signal_subtract_relaxed)* hsa_signal_subtract_relaxed_fn;
-  union {
-    decltype(hsa_signal_subtract_scacquire)* hsa_signal_subtract_scacquire_fn;
-    decltype(hsa_signal_subtract_acquire)* hsa_signal_subtract_acquire_fn;
-  };
-  union {
-    decltype(hsa_signal_subtract_screlease)* hsa_signal_subtract_screlease_fn;
-    decltype(hsa_signal_subtract_release)* hsa_signal_subtract_release_fn;
-  };
-  union {
-    decltype(hsa_signal_subtract_scacq_screl)* hsa_signal_subtract_scacq_screl_fn;
-    decltype(hsa_signal_subtract_acq_rel)* hsa_signal_subtract_acq_rel_fn;
-  };
+  decltype(hsa_signal_subtract_scacquire)* hsa_signal_subtract_scacquire_fn;
+  decltype(hsa_signal_subtract_screlease)* hsa_signal_subtract_screlease_fn;
+  decltype(hsa_signal_subtract_scacq_screl)* hsa_signal_subtract_scacq_screl_fn;
   decltype(hsa_signal_cas_relaxed)* hsa_signal_cas_relaxed_fn;
-  union {
-    decltype(hsa_signal_cas_scacquire)* hsa_signal_cas_scacquire_fn;
-    decltype(hsa_signal_cas_acquire)* hsa_signal_cas_acquire_fn;
-  };
-  union {
-    decltype(hsa_signal_cas_screlease)* hsa_signal_cas_screlease_fn;
-    decltype(hsa_signal_cas_release)* hsa_signal_cas_release_fn;
-  };
-  union {
-    decltype(hsa_signal_cas_scacq_screl)* hsa_signal_cas_scacq_screl_fn;
-    decltype(hsa_signal_cas_acq_rel)* hsa_signal_cas_acq_rel_fn;
-  };
+  decltype(hsa_signal_cas_scacquire)* hsa_signal_cas_scacquire_fn;
+  decltype(hsa_signal_cas_screlease)* hsa_signal_cas_screlease_fn;
+  decltype(hsa_signal_cas_scacq_screl)* hsa_signal_cas_scacq_screl_fn;
 
   //===--- Instruction Set Architecture -----------------------------------===//
 
@@ -433,7 +358,7 @@ struct HsaApiTable {
 
   // Version of Hsa Api Table
   ApiTableVersion version;
-  
+
   // Table of function pointers to HSA Core Runtime
 	CoreApiTable* core_;
 
@@ -442,10 +367,9 @@ struct HsaApiTable {
 
   // Table of function pointers to HSA Finalizer Extension
 	FinalizerExtTable* finalizer_ext_;
-  
+
   // Table of function pointers to HSA Image Extension
 	ImageExtTable* image_ext_;
-
 };
 
 // Structure containing instances of different api tables
@@ -461,12 +385,12 @@ struct HsaApiTableContainer {
     root.version.major_id = HSA_API_TABLE_MAJOR_VERSION;
     root.version.minor_id = sizeof(HsaApiTable);
     root.version.step_id = HSA_API_TABLE_STEP_VERSION;
-    
+
     core.version.major_id = HSA_CORE_API_TABLE_MAJOR_VERSION;
     core.version.minor_id = sizeof(CoreApiTable);
     core.version.step_id = HSA_CORE_API_TABLE_STEP_VERSION;
     root.core_ = &core;
-    
+
     amd_ext.version.major_id = HSA_AMD_EXT_API_TABLE_MAJOR_VERSION;
     amd_ext.version.minor_id = sizeof(AmdExtTable);
     amd_ext.version.step_id = HSA_AMD_EXT_API_TABLE_STEP_VERSION;
@@ -487,9 +411,23 @@ struct HsaApiTableContainer {
 // Api to copy function pointers of a table
 static
 void inline copyApi(void* src, void* dest, size_t size) {
+  assert(size >= sizeof(ApiTableVersion));
   memcpy((char*)src + sizeof(ApiTableVersion),
          (char*)dest + sizeof(ApiTableVersion),
          (size - sizeof(ApiTableVersion)));
+}
+
+// Copy Api child tables if valid.
+static void inline copyElement(ApiTableVersion* dest, ApiTableVersion* src) {
+  if (src->major_id && (dest->major_id == src->major_id)) {
+    dest->step_id = src->step_id;
+    dest->minor_id = Min(dest->minor_id, src->minor_id);
+    copyApi(dest, src, dest->minor_id);
+  } else {
+    dest->major_id = 0;
+    dest->minor_id = 0;
+    dest->step_id = 0;
+  }
 }
 
 // Copy constructor for all Api tables. The function assumes the
@@ -498,53 +436,29 @@ void inline copyApi(void* src, void* dest, size_t size) {
 // The function will overwrite the value of Minor Id by taking the
 // minimum of source and destination parameters. It will also overwrite
 // the stepping Id with value from source parameter.
-static const
-void inline copyTables(const HsaApiTable* src, HsaApiTableContainer* dest) {
-
-  // Verify Major Id of source and destination tables are valid
-  assert(dest->root.version.major_id == src->version.major_id);
-  assert(dest->core.version.major_id == src->core_->version.major_id);
-  assert(dest->amd_ext.version.major_id == src->amd_ext_->version.major_id);
-  assert(dest->finalizer_ext.version.major_id == src->finalizer_ext_->version.major_id);
-  assert(dest->image_ext.version.major_id == src->image_ext_->version.major_id);
+static void inline copyTables(const HsaApiTable* src, HsaApiTable* dest) {
+  // Verify Major Id of source and destination tables match
+  if (dest->version.major_id != src->version.major_id) {
+    dest->version.major_id = 0;
+    dest->version.minor_id = 0;
+    dest->version.step_id = 0;
+    return;
+  }
 
   // Initialize the stepping id and minor id of root table. For the
   // minor id which encodes struct size, take the minimum of source
   // and destination parameters
-  dest->root.version.step_id = src->version.step_id;
-  dest->root.version.minor_id = Min(dest->root.version.minor_id, src->version.minor_id);
-  
-  // Copy the Core Api table
-  size_t size = dest->root.version.minor_id;
-  if (size > offsetof(HsaApiTable, core_)) {
-    dest->core.version.step_id = src->core_->version.step_id;
-    dest->core.version.minor_id = Min(dest->core.version.minor_id,
-                                      src->core_->version.minor_id);
-    copyApi(&dest->core, src->core_, dest->core.version.minor_id);
-  }
-  
-  // Copy the Amd Ext Api table
-  if (size > offsetof(HsaApiTable, amd_ext_)) {
-    dest->amd_ext.version.step_id = src->amd_ext_->version.step_id;
-    dest->amd_ext.version.minor_id = Min(dest->core.version.minor_id,
-                                         src->amd_ext_->version.minor_id);
-    copyApi(&dest->amd_ext, src->amd_ext_, dest->amd_ext.version.minor_id);
-  }
-  
-  // Copy the Finalizer Ext Api table
-  if (size > offsetof(HsaApiTable, finalizer_ext_)) {
-    dest->finalizer_ext.version.step_id = src->finalizer_ext_->version.step_id;
-    dest->finalizer_ext.version.minor_id = Min(dest->core.version.minor_id,
-                                               src->finalizer_ext_->version.minor_id);
-    copyApi(&dest->finalizer_ext, src->finalizer_ext_, dest->finalizer_ext.version.minor_id);
-  }
-  
-  // Copy the Image Ext Api table
-  if (size > offsetof(HsaApiTable, image_ext_)) {
-    dest->image_ext.version.step_id = src->image_ext_->version.step_id;
-    dest->image_ext.version.minor_id = Min(dest->core.version.minor_id,
-                                           src->image_ext_->version.minor_id);
-    copyApi(&dest->image_ext, src->image_ext_, dest->image_ext.version.minor_id);
-  }
+  dest->version.step_id = src->version.step_id;
+  dest->version.minor_id = Min(dest->version.minor_id, src->version.minor_id);
+
+  // Copy child tables if present
+  if ((offsetof(HsaApiTable, core_) < dest->version.minor_id))
+    copyElement(&dest->core_->version, &src->core_->version);
+  if ((offsetof(HsaApiTable, amd_ext_) < dest->version.minor_id))
+    copyElement(&dest->amd_ext_->version, &src->amd_ext_->version);
+  if ((offsetof(HsaApiTable, finalizer_ext_) < dest->version.minor_id))
+    copyElement(&dest->finalizer_ext_->version, &src->finalizer_ext_->version);
+  if ((offsetof(HsaApiTable, image_ext_) < dest->version.minor_id))
+    copyElement(&dest->image_ext_->version, &src->image_ext_->version);
 }
 #endif

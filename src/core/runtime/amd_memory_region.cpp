@@ -49,6 +49,7 @@
 #include "core/inc/amd_cpu_agent.h"
 #include "core/inc/amd_gpu_agent.h"
 #include "core/util/utils.h"
+#include "core/inc/exceptions.h"
 
 namespace amd {
 void* MemoryRegion::AllocateKfdMemory(const HsaMemFlags& flag,
@@ -81,32 +82,30 @@ bool MemoryRegion::RegisterMemory(void* ptr, size_t size, size_t num_nodes,
 
 void MemoryRegion::DeregisterMemory(void* ptr) { hsaKmtDeregisterMemory(ptr); }
 
-bool MemoryRegion::MakeKfdMemoryResident(size_t num_node, const uint32_t* nodes,
-                                         void* ptr, size_t size,
-                                         uint64_t* alternate_va,
+bool MemoryRegion::MakeKfdMemoryResident(size_t num_node, const uint32_t* nodes, const void* ptr,
+                                         size_t size, uint64_t* alternate_va,
                                          HsaMemMapFlags map_flag) {
   assert(num_node > 0);
   assert(nodes != NULL);
 
   *alternate_va = 0;
-  const HSAKMT_STATUS status =
-      hsaKmtMapMemoryToGPUNodes(ptr, size, alternate_va, map_flag, num_node,
-                                const_cast<uint32_t*>(nodes));
+  const HSAKMT_STATUS status = hsaKmtMapMemoryToGPUNodes(
+      const_cast<void*>(ptr), size, alternate_va, map_flag, num_node, const_cast<uint32_t*>(nodes));
 
   return (status == HSAKMT_STATUS_SUCCESS);
 }
 
-void MemoryRegion::MakeKfdMemoryUnresident(void* ptr) {
-  hsaKmtUnmapMemoryToGPU(ptr);
+void MemoryRegion::MakeKfdMemoryUnresident(const void* ptr) {
+  hsaKmtUnmapMemoryToGPU(const_cast<void*>(ptr));
 }
 
-MemoryRegion::MemoryRegion(bool fine_grain, bool full_profile,
-                           core::Agent* owner,
+MemoryRegion::MemoryRegion(bool fine_grain, bool full_profile, core::Agent* owner,
                            const HsaMemoryProperties& mem_props)
     : core::MemoryRegion(fine_grain, full_profile, owner),
       mem_props_(mem_props),
       max_single_alloc_size_(0),
-      virtual_size_(0) {
+      virtual_size_(0),
+      fragment_allocator_(BlockAllocator(*this)) {
   virtual_size_ = GetPhysicalSize();
 
   mem_flag_.Value = 0;
@@ -137,8 +136,7 @@ MemoryRegion::MemoryRegion(bool fine_grain, bool full_profile,
         (full_profile) ? os::GetUserModeVirtualMemorySize() : kGpuVmSize;
   }
 
-  max_single_alloc_size_ =
-      AlignDown(static_cast<size_t>(GetPhysicalSize()), kPageSize_);
+  max_single_alloc_size_ = AlignDown(static_cast<size_t>(GetPhysicalSize()), kPageSize_);
 
   mem_flag_.ui32.CoarseGrain = (fine_grain) ? 0 : 1;
 
@@ -149,8 +147,7 @@ MemoryRegion::MemoryRegion(bool fine_grain, bool full_profile,
 
 MemoryRegion::~MemoryRegion() {}
 
-hsa_status_t MemoryRegion::Allocate(size_t size, AllocateFlags alloc_flags,
-                                    void** address) const {
+hsa_status_t MemoryRegion::Allocate(size_t& size, AllocateFlags alloc_flags, void** address) const {
   if (address == NULL) {
     return HSA_STATUS_ERROR_INVALID_ARGUMENT;
   }
@@ -171,9 +168,32 @@ hsa_status_t MemoryRegion::Allocate(size_t size, AllocateFlags alloc_flags,
   kmt_alloc_flags.ui32.AQLQueueMemory =
       (alloc_flags & AllocateDoubleMap ? 1 : 0);
 
-  *address = AllocateKfdMemory(kmt_alloc_flags, owner()->node_id(), size);
+  // Only allow using the suballocator for ordinary VRAM.
+  if (IsLocalMemory()) {
+    bool subAllocEnabled = !core::Runtime::runtime_singleton_->flag().disable_fragment_alloc();
+    // Avoid modifying executable or queue allocations.
+    bool useSubAlloc = subAllocEnabled;
+    useSubAlloc &= ((alloc_flags & (~AllocateRestrict)) == 0);
+    useSubAlloc &= (size <= fragment_allocator_.max_alloc());
+    if (useSubAlloc) {
+      *address = fragment_allocator_.alloc(size);
+      return HSA_STATUS_SUCCESS;
+    }
+    if (subAllocEnabled) {
+      // Pad up larger VRAM allocations.
+      size = AlignUp(size, fragment_allocator_.max_alloc());
+    }
+  }
 
-  if (*address != NULL) {
+  // Allocate memory.
+  // If it fails attempt to release memory from the block allocator and retry.
+  *address = AllocateKfdMemory(kmt_alloc_flags, owner()->node_id(), size);
+  if (*address == nullptr) {
+    fragment_allocator_.trim();
+    *address = AllocateKfdMemory(kmt_alloc_flags, owner()->node_id(), size);
+  }
+
+  if (*address != nullptr) {
     // Commit the memory.
     // For system memory, on non-restricted allocation, map it to all GPUs. On
     // restricted allocation, only CPU is allowed to access by default, so
@@ -222,6 +242,8 @@ hsa_status_t MemoryRegion::Allocate(size_t size, AllocateFlags alloc_flags,
 }
 
 hsa_status_t MemoryRegion::Free(void* address, size_t size) const {
+  if (fragment_allocator_.free(address)) return HSA_STATUS_SUCCESS;
+
   MakeKfdMemoryUnresident(address);
 
   FreeKfdMemory(address, size);
@@ -265,22 +287,14 @@ hsa_status_t MemoryRegion::GetInfo(hsa_region_info_t attribute,
       }
       break;
     case HSA_REGION_INFO_SIZE:
-      switch (mem_props_.HeapType) {
-        case HSA_HEAPTYPE_FRAME_BUFFER_PRIVATE:
-        case HSA_HEAPTYPE_FRAME_BUFFER_PUBLIC:
-          *((size_t*)value) = static_cast<size_t>(GetPhysicalSize());
-          break;
-        default:
-          *((size_t*)value) = static_cast<size_t>(
-              (full_profile()) ? GetVirtualSize() : GetPhysicalSize());
-          break;
-      }
+      *((size_t*)value) = static_cast<size_t>(GetPhysicalSize());
       break;
     case HSA_REGION_INFO_ALLOC_MAX_SIZE:
       switch (mem_props_.HeapType) {
         case HSA_HEAPTYPE_FRAME_BUFFER_PRIVATE:
         case HSA_HEAPTYPE_FRAME_BUFFER_PUBLIC:
         case HSA_HEAPTYPE_SYSTEM:
+        case HSA_HEAPTYPE_GPU_SCRATCH:
           *((size_t*)value) = max_single_alloc_size_;
           break;
         default:
@@ -432,6 +446,34 @@ hsa_status_t MemoryRegion::AllowAccess(uint32_t num_agents,
     return HSA_STATUS_ERROR;
   }
 
+  // Adjust for fragments.  Make accessibility sticky for fragments since this will satisfy the
+  // union of accessible agents between the fragments in the block.
+  hsa_amd_pointer_info_t info;
+  uint32_t agent_count = 0;
+  hsa_agent_t* accessible = nullptr;
+  MAKE_SCOPE_GUARD([&]() { free(accessible); });
+  core::Runtime::PtrInfoBlockData blockInfo;
+  std::vector<uint64_t> union_agents;
+  info.size = sizeof(info);
+
+  ScopedAcquire<KernelMutex> lock(&access_lock_);
+  if (core::Runtime::runtime_singleton_->PtrInfo(const_cast<void*>(ptr), &info, malloc,
+                                                 &agent_count, &accessible,
+                                                 &blockInfo) == HSA_STATUS_SUCCESS) {
+    if (blockInfo.length != size || info.sizeInBytes != size) {
+      for (int i = 0; i < num_agents; i++) union_agents.push_back(agents[i].handle);
+      for (int i = 0; i < agent_count; i++) union_agents.push_back(accessible[i].handle);
+      std::sort(union_agents.begin(), union_agents.end());
+      const auto& last = std::unique(union_agents.begin(), union_agents.end());
+      union_agents.erase(last, union_agents.end());
+
+      agents = reinterpret_cast<hsa_agent_t*>(&union_agents[0]);
+      num_agents = union_agents.size();
+      size = blockInfo.length;
+      ptr = blockInfo.base;
+    }
+  }
+
   bool cpu_in_list = false;
 
   std::set<GpuAgentInt*> whitelist_gpus;
@@ -453,15 +495,16 @@ hsa_status_t MemoryRegion::AllowAccess(uint32_t num_agents,
   if (whitelist_nodes.size() == 0 && IsSystem()) {
     assert(cpu_in_list);
     // This is a system region and only CPU agents in the whitelist.
-    // No need to call map.
+    // Remove old mappings.
+    amd::MemoryRegion::MakeKfdMemoryUnresident(ptr);
     return HSA_STATUS_SUCCESS;
   }
 
   // If this is a local memory region, the owning gpu always needs to be in
   // the whitelist.
   if (IsPublic() &&
-      std::find(whitelist_nodes.begin(), whitelist_nodes.end(),
-                owner()->node_id()) == whitelist_nodes.end()) {
+      std::find(whitelist_nodes.begin(), whitelist_nodes.end(), owner()->node_id()) ==
+          whitelist_nodes.end()) {
     whitelist_nodes.push_back(owner()->node_id());
     whitelist_gpus.insert(reinterpret_cast<GpuAgentInt*>(owner()));
   }
@@ -469,19 +512,20 @@ hsa_status_t MemoryRegion::AllowAccess(uint32_t num_agents,
   HsaMemMapFlags map_flag = map_flag_;
   map_flag.ui32.HostAccess |= (cpu_in_list) ? 1 : 0;
 
-  
   {
     ScopedAcquire<KernelMutex> lock(&core::Runtime::runtime_singleton_->memory_lock_);
     uint64_t alternate_va = 0;
     if (!amd::MemoryRegion::MakeKfdMemoryResident(
-      whitelist_nodes.size(), &whitelist_nodes[0], const_cast<void*>(ptr),
+      whitelist_nodes.size(), &whitelist_nodes[0], ptr,
       size, &alternate_va, map_flag)) {
         return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
     }
   }
 
+  lock.Release();
+
   for (GpuAgentInt* gpu : whitelist_gpus) {
-    gpu->InitDma();
+    gpu->PreloadBlits();
   }
 
   return HSA_STATUS_SUCCESS;
@@ -522,7 +566,7 @@ hsa_status_t MemoryRegion::Lock(uint32_t num_agents, const hsa_agent_t* agents,
         core::Runtime::runtime_singleton_->gpu_agents().begin(),
         core::Runtime::runtime_singleton_->gpu_agents().end());
   } else {
-    for (int i = 0; i < num_agents; ++i) {
+    for (uint32_t i = 0; i < num_agents; ++i) {
       core::Agent* agent = core::Agent::Convert(agents[i]);
       if (agent == NULL || !agent->IsValid()) {
         return HSA_STATUS_ERROR_INVALID_AGENT;
@@ -530,7 +574,7 @@ hsa_status_t MemoryRegion::Lock(uint32_t num_agents, const hsa_agent_t* agents,
 
       if (agent->device_type() == core::Agent::kAmdGpuDevice) {
         whitelist_nodes.push_back(agent->node_id());
-        whitelist_gpus.insert(reinterpret_cast<GpuAgentInt*>(agent));
+        whitelist_gpus.insert(agent);
       }
     }
   }
@@ -553,8 +597,9 @@ hsa_status_t MemoryRegion::Lock(uint32_t num_agents, const hsa_agent_t* agents,
       } else {
         *agent_ptr = host_ptr;
       }
-      for (core::Agent* gpu : whitelist_gpus) {
-        reinterpret_cast<GpuAgentInt*>(gpu)->InitDma();
+
+      for (auto gpu : whitelist_gpus) {
+        static_cast<GpuAgentInt*>(gpu)->PreloadBlits();
       }
 
       return HSA_STATUS_SUCCESS;
@@ -585,6 +630,21 @@ hsa_status_t MemoryRegion::AssignAgent(void* ptr, size_t size,
                                        const core::Agent& agent,
                                        hsa_access_permission_t access) const {
   return HSA_STATUS_SUCCESS;
+}
+
+void* MemoryRegion::BlockAllocator::alloc(size_t request_size, size_t& allocated_size) const {
+  assert(request_size <= block_size() && "BlockAllocator alloc request exceeds block size.");
+
+  void* ret;
+  size_t bsize = block_size();
+  hsa_status_t err = region_.Allocate(
+      bsize, core::MemoryRegion::AllocateRestrict | core::MemoryRegion::AllocateDirect, &ret);
+  if (err != HSA_STATUS_SUCCESS)
+    throw ::AMD::hsa_exception(err, "MemoryRegion::BlockAllocator::alloc failed.");
+  assert(ret != nullptr && "Region returned nullptr on success.");
+
+  allocated_size = block_size();
+  return ret;
 }
 
 }  // namespace

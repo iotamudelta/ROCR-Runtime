@@ -68,9 +68,8 @@ int InterruptSignal::rtti_id_ = 0;
 
 void InterruptSignal::DestroyEvent(HsaEvent* evt) { hsaKmtDestroyEvent(evt); }
 
-InterruptSignal::InterruptSignal(hsa_signal_value_t initial_value,
-                                 HsaEvent* use_event)
-    : Signal(initial_value) {
+InterruptSignal::InterruptSignal(hsa_signal_value_t initial_value, HsaEvent* use_event)
+    : LocalSignal(initial_value), Signal(signal()) {
   if (use_event != NULL) {
     event_ = use_event;
     free_event_ = false;
@@ -90,10 +89,6 @@ InterruptSignal::InterruptSignal(hsa_signal_value_t initial_value,
 }
 
 InterruptSignal::~InterruptSignal() {
-  invalid_ = true;
-  SetEvent();
-  while (InUse())
-    ;
   if (free_event_) hsaKmtDestroyEvent(event_);
 }
 
@@ -120,22 +115,21 @@ void InterruptSignal::StoreRelease(hsa_signal_value_t value) {
 hsa_signal_value_t InterruptSignal::WaitRelaxed(
     hsa_signal_condition_t condition, hsa_signal_value_t compare_value,
     uint64_t timeout, hsa_wait_state_t wait_hint) {
-  uint32_t prior = atomic::Increment(&waiting_);
+  Retain();
+  MAKE_SCOPE_GUARD([&]() { Release(); });
 
-  // assert(prior == 0 && "Multiple waiters on interrupt signal!");
+  uint32_t prior = waiting_++;
+  MAKE_SCOPE_GUARD([&]() { waiting_--; });
   // Allow only the first waiter to sleep (temporary, known to be bad).
   if (prior != 0) wait_hint = HSA_WAIT_STATE_ACTIVE;
-
-  MAKE_SCOPE_GUARD([&]() { atomic::Decrement(&waiting_); });
 
   int64_t value;
 
   timer::fast_clock::time_point start_time = timer::fast_clock::now();
 
   // Set a polling timeout value
-  // Exact time is not hugely important, it should just be a short while which
-  // is smaller than the thread scheduling quantum (usually around 16ms)
-  const timer::fast_clock::duration kMaxElapsed = std::chrono::milliseconds(5);
+  // Should be a few times bigger than null kernel latency
+  const timer::fast_clock::duration kMaxElapsed = std::chrono::microseconds(200);
 
   uint64_t hsa_freq;
   HSA::hsa_system_get_info(HSA_SYSTEM_INFO_TIMESTAMP_FREQUENCY, &hsa_freq);
@@ -145,7 +139,7 @@ hsa_signal_value_t InterruptSignal::WaitRelaxed(
 
   bool condition_met = false;
   while (true) {
-    if (invalid_) return 0;
+    if (!IsValid()) return 0;
 
     value = atomic::Load(&signal_.value, std::memory_order_relaxed);
 
@@ -172,23 +166,26 @@ hsa_signal_value_t InterruptSignal::WaitRelaxed(
     if (condition_met) return hsa_signal_value_t(value);
 
     timer::fast_clock::time_point time = timer::fast_clock::now();
-    if (time - start_time > kMaxElapsed) {
-      if (time - start_time > fast_timeout) {
-        value = atomic::Load(&signal_.value, std::memory_order_relaxed);
-        return hsa_signal_value_t(value);
-      }
-      if (wait_hint != HSA_WAIT_STATE_ACTIVE) {
-        uint32_t wait_ms;
-        auto time_remaining = fast_timeout - (time - start_time);
-        if ((timeout == -1) ||
-            (time_remaining > std::chrono::milliseconds(uint32_t(-1))))
-          wait_ms = uint32_t(-1);
-        else
-          wait_ms = timer::duration_cast<std::chrono::milliseconds>(
-                        time_remaining).count();
-        hsaKmtWaitOnEvent(event_, wait_ms);
-      }
+    if (time - start_time > fast_timeout) {
+      value = atomic::Load(&signal_.value, std::memory_order_relaxed);
+      return hsa_signal_value_t(value);
     }
+    
+    if (wait_hint == HSA_WAIT_STATE_ACTIVE) {
+      continue;
+    }
+
+    if (time - start_time < kMaxElapsed) {
+    //  os::uSleep(20);
+      continue;
+    }
+
+    uint32_t wait_ms;
+    auto time_remaining = fast_timeout - (time - start_time);
+    uint64_t ct=timer::duration_cast<std::chrono::milliseconds>(
+      time_remaining).count();
+    wait_ms = (ct>0xFFFFFFFEu) ? 0xFFFFFFFEu : ct;
+    hsaKmtWaitOnEvent(event_, wait_ms);
   }
 }
 

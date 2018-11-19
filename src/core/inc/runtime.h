@@ -50,8 +50,10 @@
 
 #include "core/inc/hsa_ext_interface.h"
 #include "core/inc/hsa_internal.h"
+#include "core/inc/hsa_ext_amd_impl.h"
 
 #include "core/inc/agent.h"
+#include "core/inc/exceptions.h"
 #include "core/inc/memory_region.h"
 #include "core/inc/signal.h"
 #include "core/util/flag.h"
@@ -264,8 +266,14 @@ class Runtime {
 
   hsa_status_t InteropUnmap(void* ptr);
 
+  struct PtrInfoBlockData {
+    void* base;
+    size_t length;
+  };
+
   hsa_status_t PtrInfo(void* ptr, hsa_amd_pointer_info_t* info, void* (*alloc)(size_t),
-                       uint32_t* num_agents_accessible, hsa_agent_t** accessible);
+                       uint32_t* num_agents_accessible, hsa_agent_t** accessible,
+                       PtrInfoBlockData* block_info = nullptr);
 
   hsa_status_t SetPtrInfoData(void* ptr, void* userptr);
 
@@ -311,17 +319,26 @@ class Runtime {
 
   ExtensionEntryPoints extensions_;
 
+  hsa_status_t SetCustomSystemEventHandler(hsa_amd_system_event_callback_t callback,
+                                           void* data);
+
+  void* GetCustomSystemEventData() { return system_event_handler_user_data_; }
+
+  AMD::callback_t<hsa_amd_system_event_callback_t> GetCustomSystemEventHandler() {
+    return system_event_handler_;
+  }
+
  protected:
   static void AsyncEventsLoop(void*);
 
   struct AllocationRegion {
-    AllocationRegion() : region(NULL), assigned_agent_(NULL), size(0) {}
+    AllocationRegion() : region(NULL), size(0), user_ptr(nullptr) {}
     AllocationRegion(const MemoryRegion* region_arg, size_t size_arg)
-        : region(region_arg), assigned_agent_(NULL), size(size_arg) {}
+        : region(region_arg), size(size_arg), user_ptr(nullptr) {}
 
     const MemoryRegion* region;
-    const Agent* assigned_agent_;
     size_t size;
+    void* user_ptr;
   };
 
   struct AsyncEventsControl {
@@ -473,9 +490,6 @@ class Runtime {
 
   AsyncEvents new_async_events_;
 
-  // Queue id counter.
-  uint32_t queue_count_;
-
   // Starting address of SVM address space.
   // On APU the cpu and gpu could access the area inside starting and end of
   // the SVM address space.
@@ -496,8 +510,13 @@ class Runtime {
   // @brief HSA signal to contain the VM fault event.
   Signal* vm_fault_signal_;
 
+  // Custom system event handler.
+  AMD::callback_t<hsa_amd_system_event_callback_t> system_event_handler_;
+
+  void* system_event_handler_user_data_;
+
   // Holds reference count to runtime object.
-  volatile uint32_t ref_count_;
+  std::atomic<uint32_t> ref_count_;
 
   // Track environment variables.
   Flag flag_;

@@ -54,7 +54,7 @@ typedef void* Mutex;
 typedef void* Thread;
 typedef void* EventHandle;
 
-enum class os_t { OS_WIN = 0, OS_LINUX, OS_FREEBSD COUNT };
+enum class os_t { OS_WIN = 0, OS_LINUX, OS_FREEBSD, COUNT };
 static __forceinline std::underlying_type<os_t>::type os_index(os_t val) {
   return std::underlying_type<os_t>::type(val);
 }

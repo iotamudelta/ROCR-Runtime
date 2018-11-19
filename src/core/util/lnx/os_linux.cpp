@@ -40,7 +40,7 @@
 //
 ////////////////////////////////////////////////////////////////////////////////
 
-#ifdef __linux__
+#if defined(__linux__) || defined(__FreeBSD__)
 #include "core/util/os.h"
 
 #include <link.h>

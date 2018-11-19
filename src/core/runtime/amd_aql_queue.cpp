@@ -42,7 +42,7 @@
 
 #include "core/inc/amd_aql_queue.h"
 
-#ifdef __linux__
+#if defined(__linux__) || defined(__FreeBSD__)
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -456,7 +456,7 @@ uint32_t AqlQueue::ComputeRingBufferMinPkts() {
   uint32_t min_bytes = 0x400;
 
   if (queue_full_workaround_ == 1) {
-#ifdef __linux__
+#if defined(__linux__) || defined(__FreeBSD__)
     // Double mapping requires one page of backing store.
     min_bytes = Max(min_bytes, 0x1000U);
 #endif
@@ -492,7 +492,7 @@ void AqlQueue::AllocRegisteredRingBuffer(uint32_t queue_size_pkts) {
         uint32_t(queue_size_pkts * sizeof(core::AqlPacket));
     ring_buf_alloc_bytes_ = 2 * ring_buf_phys_size_bytes;
 
-#ifdef __linux__
+#if defined(__linux__) || defined(__FreeBSD__)
     // Create a system-unique shared memory path for this thread.
     char ring_buf_shm_path[16];
 #ifdef __FreeBSD__
@@ -639,7 +639,7 @@ void AqlQueue::AllocRegisteredRingBuffer(uint32_t queue_size_pkts) {
 
 void AqlQueue::FreeRegisteredRingBuffer() {
   if ((agent_->profile() == HSA_PROFILE_FULL) && queue_full_workaround_) {
-#ifdef __linux__
+#if defined(__linux__) || defined(__FreeBSD__)
     munmap(ring_buf_, ring_buf_alloc_bytes_);
 #endif
 #ifdef _WIN32
@@ -656,7 +656,7 @@ void AqlQueue::FreeRegisteredRingBuffer() {
 }
 
 void AqlQueue::CloseRingBufferFD(const char* ring_buf_shm_path, int fd) const {
-#ifdef __linux__
+#if defined(__linux__) || defined(__FreeBSD__)
 #if !defined(HAVE_MEMFD_CREATE)
   shm_unlink(ring_buf_shm_path);
 #endif
@@ -668,7 +668,7 @@ void AqlQueue::CloseRingBufferFD(const char* ring_buf_shm_path, int fd) const {
 
 int AqlQueue::CreateRingBufferFD(const char* ring_buf_shm_path,
                                  uint32_t ring_buf_phys_size_bytes) const {
-#ifdef __linux__
+#if defined(__linux__) || defined(__FreeBSD__)
   int fd;
 #ifdef HAVE_MEMFD_CREATE
   fd = syscall(__NR_memfd_create, ring_buf_shm_path, 0);

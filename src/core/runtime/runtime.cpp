@@ -1247,13 +1247,17 @@ void Runtime::LoadExtensions() {
 // Load finalizer and extension library
 #ifdef HSA_LARGE_MODEL
   static const std::string kFinalizerLib[] = {"hsa-ext-finalize64.dll",
+                                              "libhsa-ext-finalize64.so.1",
                                               "libhsa-ext-finalize64.so.1"};
   static const std::string kImageLib[] = {"hsa-ext-image64.dll",
+                                          "libhsa-ext-image64.so.1",
                                           "libhsa-ext-image64.so.1"};
 #else
   static const std::string kFinalizerLib[] = {"hsa-ext-finalize.dll",
+                                              "libhsa-ext-finalize.so.1",
                                               "libhsa-ext-finalize.so.1"};
   static const std::string kImageLib[] = {"hsa-ext-image.dll",
+                                          "libhsa-ext-image.so.1",
                                           "libhsa-ext-image.so.1"};
 #endif
 
